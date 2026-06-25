@@ -29,8 +29,11 @@ RUN apk add --no-cache \
     jq \
     vim \
     nano \
-    yq \
-    go
+    yq 
+
+RUN apk add --no-cache \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
+    go musl-dev
 
 RUN go install oras.land/oras/cmd/oras@v1.3.0
 
