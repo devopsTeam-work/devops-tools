@@ -29,7 +29,10 @@ RUN apk add --no-cache \
     jq \
     vim \
     nano \
-    yq
+    yq \
+    go
+
+RUN go install oras.land/oras/cmd/oras@v1.3.0
 
 RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git && \
     helm plugin install https://github.com/C123R/helm-blob.git && \
