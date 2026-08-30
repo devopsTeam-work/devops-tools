@@ -59,9 +59,10 @@ RUN rm jfr.zip
 
 RUN chmod +x /opt/jfr/bin/jenkinsfile-runner 
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
+RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian mcp-atlassian==0.23.1
+RUN uv pip install  --system --no-cache-dir --prefix=/opt/jenkins-mcp mcp-jenkins==3.5.0
 RUN npm install -g --prefix=/opt/gitlab-mcp "@structured-world/gitlab-mcp@9.1.2"
-RUN pip3 install --no-cache-dir --prefix=/opt/jenkins-mcp mcp-jenkins==3.5.0
-RUN pip3 install mcp-atlassian==0.23.1
 
 # Download Jenkins WAR core and core pipeline plugins
 RUN mkdir -p ${JENKINS_HOME}/plugins
