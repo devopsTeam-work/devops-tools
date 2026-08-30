@@ -54,9 +54,9 @@ WORKDIR /opt
 # Download and set up Jenkinsfile Runner
 ARG JFR_VERSION=1.0-beta-32
 RUN curl -fsSL -o jfr.zip https://github.com/jenkinsci/jenkinsfile-runner/releases/download/${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip \
-    && unzip jfr.zip \
-    && mv jenkinsfile-runner-${JFR_VERSION} /opt/jenkinsfile-runner \
-    && chmod +x /opt/jenkinsfile-runner/bin/jenkinsfile-runner \
+    && unzip jfr.zip -d jfr \
+    && mv jfr /opt/jfr \
+    && chmod +x /opt/jfr/bin/jenkinsfile-runner \
     && rm jfr.zip
 
 RUN npm install -g --prefix=/opt/gitlab-mcp "@structured-world/gitlab-mcp@9.1.2"
