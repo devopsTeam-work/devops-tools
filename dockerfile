@@ -52,7 +52,7 @@ ENV PATH="/opt/jenkinsfile-runner/bin:${PATH}"
 WORKDIR /opt
 
 # Download and set up Jenkinsfile Runner
-ARG JFR_VERSION=1.0-beta-33
+ARG JFR_VERSION=1.0-beta-32
 RUN curl -fsSL -o jfr.zip https://github.com/jenkinsci/jenkinsfile-runner/releases/download/${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip \
     && unzip jfr.zip \
     && mv jenkinsfile-runner-${JFR_VERSION} /opt/jenkinsfile-runner \
