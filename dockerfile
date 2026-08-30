@@ -59,6 +59,11 @@ RUN curl -fsSL -o jfr.zip https://github.com/jenkinsci/jenkinsfile-runner/releas
     && chmod +x /opt/jenkinsfile-runner/bin/jenkinsfile-runner \
     && rm jfr.zip
 
+
+RUN npm install -g --prefix=/opt/gitlab-mcp "@structured-world/gitlab-mcp@9.1.2"
+RUN pip3 install --no-cache-dir --prefix=/opt/jenkins-mcp mcp-jenkins==3.5.0
+RUN pip3 install mcp-atlassian==0.23.1
+
 # Download Jenkins WAR core and core pipeline plugins
 RUN mkdir -p ${JENKINS_HOME}/plugins
 
