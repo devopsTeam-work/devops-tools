@@ -10,6 +10,7 @@ COPY --from=ct-source /usr/local/bin/ct /usr/local/bin/ct
 # Install base tools
 RUN apk add --no-cache \
     git \
+    git-lfs \
     bash \
     tcsh \
     curl \
@@ -29,7 +30,76 @@ RUN apk add --no-cache \
     jq \
     vim \
     nano \
-    yq 
+    yq \
+    podman \
+    fuse-overlayfs \
+    openjdk21-jre \
+    bash \
+    unzip \
+    tar \
+    ttf-dejavu \
+    npm
+
+RUN curl -fsSL https://github.com/jenkins-zh/jenkins-cli/releases/latest/download/jcli-linux-amd64.tar.gz | tar -xz -C /usr/local/bin/
+RUN chmod +x /usr/local/bin/jcli
+
+# Environment variables updated for Java 21
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+ENV JENKINS_HOME=/opt/jenkins
+ENV PATH="/opt/jenkinsfile-runner/bin:${PATH}"
+
+WORKDIR /opt
+
+# Download and set up Jenkinsfile Runner
+ARG JFR_VERSION=1.0-beta-33
+RUN curl -fsSL -o jfr.zip https://github.com/jenkinsci/jenkinsfile-runner/releases/download/v${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip \
+    && unzip jfr.zip \
+    && mv jenkinsfile-runner-${JFR_VERSION} /opt/jenkinsfile-runner \
+    && chmod +x /opt/jenkinsfile-runner/bin/jenkinsfile-runner \
+    && rm jfr.zip
+
+# Download Jenkins WAR core and core pipeline plugins
+RUN mkdir -p ${JENKINS_HOME}/plugins
+
+# Download LTS Jenkins WAR (Jenkins supports Java 21 as of version 2.426.1+)
+RUN curl -fsSL -o ${JENKINS_HOME}/jenkins.war https://get.jenkins.io/war-stable/latest/jenkins.war
+
+WORKDIR ${JENKINS_HOME}/plugins
+RUN curl -fsSL -O https://updates.jenkins.io/latest/workflow-aggregator.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-job.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-cps.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-basic-steps.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-durable-task-step.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-step-api.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/workflow-support.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/script-security.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/git.hpi \
+    && curl -fsSL -O https://updates.jenkins.io/latest/git-client.hpi
+
+WORKDIR /workspace
+
+
+
+RUN curl -fL https://getcli.jfrog.io && \
+    mv jf /usr/local/bin/ && \
+    chmod +x /usr/local/bin/jf
+
+# Set Rancher CLI version (change to your desired version)
+ENV RANCHER_CLI_VERSION=v2.15.1
+# Download and install Rancher CLI
+RUN curl -fsSL "https://github.com/rancher/cli/releases/download/${RANCHER_CLI_VERSION}/rancher-linux-amd64-${RANCHER_CLI_VERSION}.tar.gz" | tar -xz -C /tmp \
+    && mv /tmp/rancher-${RANCHER_CLI_VERSION}/rancher /usr/local/bin/rancher_v2.15.1 \
+    && chmod +x /usr/local/bin/rancher_v2.15.1 \
+    && rm -rf /tmp/rancher-${RANCHER_CLI_VERSION}
+
+# Set Rancher CLI version (change to your desired version)
+ENV RANCHER_CLI_VERSION=v2.10.1
+# Download and install Rancher CLI
+RUN curl -fsSL "https://github.com/rancher/cli/releases/download/${RANCHER_CLI_VERSION}/rancher-linux-amd64-${RANCHER_CLI_VERSION}.tar.gz" | tar -xz -C /tmp \
+    && mv /tmp/rancher-${RANCHER_CLI_VERSION}/rancher /usr/local/bin/rancher_v2.10.1 \
+    && chmod +x /usr/local/bin/rancher_v2.10.1 \
+    && rm -rf /tmp/rancher-${RANCHER_CLI_VERSION}
 
 RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
@@ -178,4 +248,4 @@ RUN adduser -D dockeruser && echo "dockeruser ALL=(ALL) NOPASSWD: ALL" >> /etc/s
 
 # USER dockeruser
 # WORKDIR /home/dockeruser
-ENTRYPOINT ["dockerd-entrypoint.sh"]
+ENTRYPOINT ["jenkinsfile-runner", "-w", "/opt/jenkins", "-f", "/workspace/Jenkinsfile", "-p", "/opt/jenkins/plugins", "--workspace", "/workspace"]
