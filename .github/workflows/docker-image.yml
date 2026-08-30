@@ -2,10 +2,8 @@ name: Docker Image CI
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
+    tags:
+      - '*'   # Matches any tag
 jobs:
 
   build:
@@ -13,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+        - name: show tag name
+          run: echo "$GITHUB_REF_NAME"
         - name: Checkout code
           uses: actions/checkout@v4
     
@@ -28,11 +28,11 @@ jobs:
           run: |
             docker build . \
               --file Dockerfile \
-              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:${{ env.TAG_DATE }} \
+              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:$GITHUB_REF_NAME \
               --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:latest
     
         # דחיפה (Push) של האימג' ל-Docker Hub
         - name: Push Docker image
           run: |
-            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:${{ env.TAG_DATE }}
+            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:$GITHUB_REF_NAME
             docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:latest
