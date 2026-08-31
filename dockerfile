@@ -19,7 +19,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk \
 RUN apk add --no-cache \
     git git-lfs bash tcsh curl sudo python3 py3-pip iputils tcpdump \
     helm kubectl flatpak xvfb wget skopeo zip util-linux jq vim nano \
-    yq podman podman-compose fuse-overlayfs openjdk21-jre unzip tar ttf-dejavu npm && \
+    yq podman podman-compose fuse-overlayfs openjdk21-jre unzip tar ttf-dejavu npm sshpass && \
     apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community go musl-dev
 
 ARG JFR_VERSION=1.0-beta-32
