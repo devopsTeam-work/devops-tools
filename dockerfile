@@ -3,7 +3,7 @@
 # ==========================================
 FROM alpine:3.20 AS builder
 
-RUN apk add --no-cache curl tar unzip bash ca-certificates
+RUN apk add --no-cache curl wget tar unzip bash ca-certificates
 
 WORKDIR /downloads
 
@@ -15,31 +15,39 @@ ARG ARGOCD_VERSION=2.13.1
 ARG STERN_VERSION=1.31.0
 ARG KUBECTX_VERSION=0.9.5
 
-# Download and prepare all static binary tools
+RUN mkdir -p /out/bin /out/jfr
+
+# 1. ORAS
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-    ARCH_RAW=$(uname -m) && \
-    mkdir -p /out/bin /out/jfr && \
-    # 1. ORAS (Pre-built binary instead of 'go install')
-    curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin oras && \
-    # 2. Jenkins CLI (jcli)
-    curl -fsSL https://github.com/jenkins-zh/jenkins-cli/releases/latest/download/jcli-linux-amd64.tar.gz | tar -xz -C /out/bin && \
-    # 3. Jenkinsfile Runner
-    curl -fsSL -o /tmp/jfr.zip "https://github.com/jenkinsci/jenkinsfile-runner/releases/download/${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip" && \
-    unzip /tmp/jfr.zip -d /out/jfr && rm /tmp/jfr.zip && \
-    # 4. JFrog CLI
-    curl -fL https://getcli.jfrog.io/v2-jf | sh && mv jf /out/bin/ && \
-    # 5. Rancher CLIs
-    for RV in v2.15.1 v2.10.1 v2.13.1; do \
+    curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin oras
+
+# 2. Jenkins CLI (jcli)
+RUN curl -fsSL https://github.com/jenkins-zh/jenkins-cli/releases/latest/download/jcli-linux-amd64.tar.gz | tar -xz -C /out/bin
+
+# 3. Jenkinsfile Runner
+RUN curl -fsSL -o /tmp/jfr.zip "https://github.com/jenkinsci/jenkinsfile-runner/releases/download/${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip" && \
+    unzip /tmp/jfr.zip -d /out/jfr && rm /tmp/jfr.zip
+
+# 4. JFrog CLI
+RUN curl -fL https://getcli.jfrog.io/v2-jf | sh && mv jf /out/bin/
+
+# 5. Rancher CLIs (Relative symlink fix)
+RUN for RV in v2.15.1 v2.10.1 v2.13.1; do \
         curl -fsSL "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
         mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
         rm -rf /tmp/rancher-${RV}; \
     done && \
-    ln -s /out/bin/rancher_v2.13.1 /out/bin/rancher && \
-    # 6. K3d
-    curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.8.3 USE_SUDO=false K3D_INSTALL_DIR=/out/bin bash && \
-    # 7. Helmify
-    curl -L https://github.com/arttor/helmify/releases/latest/download/helmify_Linux_x86_64.tar.gz | tar -xz -C /out/bin helmify && \
-    # 8. Kubernetes tooling
+    cd /out/bin && ln -s rancher_v2.13.1 rancher
+
+# 6. K3d
+RUN wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | USE_SUDO=false K3D_INSTALL_DIR=/out/bin bash
+
+# 7. Helmify
+RUN curl -L https://github.com/arttor/helmify/releases/latest/download/helmify_Linux_x86_64.tar.gz | tar -xz -C /out/bin helmify
+
+# 8. Kubernetes tooling
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    ARCH_RAW=$(uname -m) && \
     curl -fL "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /out/bin kubeseal && \
     curl -fL "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s && \
     curl -fL "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-${ARCH}" -o /out/bin/argocd && \
@@ -48,7 +56,6 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl -fL "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubectx_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubectx && \
     curl -fL "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens && \
     chmod +x /out/bin/* /out/jfr/bin/jenkinsfile-runner
-
 # ==========================================
 # Stage 2: Final Production Image
 # ==========================================
