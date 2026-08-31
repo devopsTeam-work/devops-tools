@@ -40,7 +40,11 @@ RUN for RV in v2.15.1 v2.10.1 v2.13.1; do \
     cd /out/bin && ln -s rancher_v2.13.1 rancher
 
 # 6. K3d
-RUN wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | USE_SUDO=false K3D_INSTALL_DIR=/out/bin bash
+ARG K3D_VERSION=v5.8.3
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    curl -fL "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-${ARCH}" -o /out/bin/k3d && \
+    chmod +x /out/bin/k3d
+
 
 # 7. Helmify
 RUN curl -L https://github.com/arttor/helmify/releases/latest/download/helmify_Linux_x86_64.tar.gz | tar -xz -C /out/bin helmify
