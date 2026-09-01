@@ -39,11 +39,6 @@ RUN for RV in v2.15.1 v2.10.1 v2.13.1; do \
     done && \
     cd /out/bin && ln -s rancher_v2.13.1 rancher
 
-# 6. K3d
-ARG K3D_VERSION=v5.8.3
-RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-    curl -fL "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-${ARCH}" -o /out/bin/k3d && \
-    chmod +x /out/bin/k3d
 
 
 # 7. Helmify
@@ -80,7 +75,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk \
 # Install Runtime APK packages (NO go, NO musl-dev compiler dependencies!)
 RUN apk add --no-cache \
     git git-lfs bash tcsh curl sudo python3 py3-pip iputils tcpdump \
-    helm kubectl flatpak xvfb wget skopeo zip util-linux jq vim nano \
+    helm kubectl wget skopeo zip util-linux jq vim nano \
     yq podman podman-compose fuse-overlayfs openjdk21-jre unzip tar ttf-dejavu npm sshpass openssh
 
 # Install Python and NPM packages, then clean cache immediately
@@ -125,11 +120,7 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
     helm plugin install https://github.com/seacrew/helm-compose && \
     rm -rf ~/.cache/helm /tmp/*
 
-# Flatpak config, User setup & Final System Cleanup
-RUN flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo && \
-    flatpak install -y flathub com.github.inercia.k3x && \
-    adduser -D dockeruser && echo "dockeruser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
-    rm -rf /var/cache/apk/* /tmp/* /var/tmp/* /root/.cache
+
 
 WORKDIR /workspace
 
