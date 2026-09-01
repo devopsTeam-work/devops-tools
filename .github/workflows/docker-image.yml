@@ -34,5 +34,5 @@ jobs:
         # דחיפה (Push) של האימג' ל-Docker Hub
         - name: Push Docker image
           run: |
-            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:$GITHUB_REF_NAME
-            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:latest
+            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:$GITHUB_REF_NAME
+            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest
