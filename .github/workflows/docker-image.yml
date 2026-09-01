@@ -28,8 +28,8 @@ jobs:
           run: |
             docker build . \
               --file Dockerfile \
-              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:$GITHUB_REF_NAME \
-              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/k3d:latest
+              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:$GITHUB_REF_NAME \
+              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest
     
         # דחיפה (Push) של האימג' ל-Docker Hub
         - name: Push Docker image
