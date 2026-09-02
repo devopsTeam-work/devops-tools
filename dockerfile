@@ -143,38 +143,48 @@ RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian --upgrade pip
     rm -rf /root/.cache /root/.npm /tmp/*
 
 # ---------- Jenkins WAR + plugins ----------
-# Both were "latest" before: not reproducible, and impossible to control which
-# CVEs land in the image. Now driven by explicit versions.
+# Every version below is explicit. The two BouncyCastle findings that appeared
+# between the first and second scan came in through "latest" plugin URLs;
+# pinning is what stops that drift.
 #
-# NOTE: set JENKINS_VERSION to the current LTS before building.
-ARG JENKINS_VERSION=2.568.2
+# 2.568.3 is the newest LTS available (2.568.2 was the previous patch).
+ARG JENKINS_VERSION=2.568.3
 
 # Format per entry: <plugin-name>:<version>
-# "latest" still works, but pin each one to make the build reproducible.
 ARG JENKINS_PLUGINS="\
-    workflow-aggregator:latest \
-    workflow-job:latest \
-    workflow-cps:latest \
-    workflow-basic-steps:latest \
-    workflow-durable-task-step:latest \
-    workflow-step-api:latest \
-    workflow-support:latest \
-    script-security:latest \
-    git:latest \
-    git-client:latest"
+    workflow-aggregator:608.v67378e9d3db_1 \
+    workflow-job:1600.v6f36ed83529d \
+    workflow-cps:4370.v49a_6937566b_6 \
+    workflow-basic-steps:1098.v808b_fd7f8cf4 \
+    workflow-durable-task-step:1479.v56e587f413a_7 \
+    workflow-step-api:724.v538c2362b_dfb_ \
+    workflow-support:1015.v785e5a_b_b_8b_22 \
+    script-security:1412.v7737b_3405f86 \
+    git:5.10.1 \
+    git-client:6.6.1"
+
+# API plugins that ship bundled inside jenkins.war. Dropping newer copies into
+# plugins/ makes Jenkins load these instead of the bundled ones at runtime:
+#   bouncycastle-api  -> BC 1.85   (CVE-2026-59650, CVE-2026-12817)
+#   jackson2-api      -> jackson-databind 2.22.2  (was 2.21.2)
+#   jackson3-api      -> jackson-databind 3.2.2   (was 3.1.3)
+#   sshd              -> newest Apache MINA       (CVE-2026-47065)
+# Set to "" to skip this block.
+ARG JENKINS_API_PLUGINS="\
+    bouncycastle-api:2.30.1.85.2-304.v4b_5b_62e59a_a_7 \
+    jackson2-api:2.22.2-445.vdc613f1d8012 \
+    jackson3-api:3.2.2-96.v599957900a_1a_ \
+    sshd:3.384.vc89b_5e138cf9"
 
 RUN mkdir -p ${JENKINS_HOME}/plugins && \
     curl ${CURL_OPTS} -o ${JENKINS_HOME}/jenkins.war \
       "https://get.jenkins.io/war-stable/${JENKINS_VERSION}/jenkins.war" && \
-    for p in ${JENKINS_PLUGINS}; do \
+    for p in ${JENKINS_PLUGINS} ${JENKINS_API_PLUGINS}; do \
         name="${p%%:*}"; ver="${p##*:}"; \
-        if [ "$ver" = "latest" ]; then \
-            url="https://updates.jenkins.io/latest/${name}.hpi"; \
-        else \
-            url="https://updates.jenkins.io/download/plugins/${name}/${ver}/${name}.hpi"; \
-        fi; \
-        curl ${CURL_OPTS} -o "${JENKINS_HOME}/plugins/${name}.hpi" "$url"; \
-    done
+        curl ${CURL_OPTS} -o "${JENKINS_HOME}/plugins/${name}.hpi" \
+          "https://updates.jenkins.io/download/plugins/${name}/${ver}/${name}.hpi"; \
+    done && \
+    ls -1 ${JENKINS_HOME}/plugins/*.hpi | wc -l
 
 # ---------- Helm plugins ----------
 # Pinned where an upstream release tag exists; the rest are unchanged.
