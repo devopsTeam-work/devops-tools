@@ -39,7 +39,7 @@ jobs:
         - name: Run Trivy Scanner (SARIF Output)
           uses: aquasecurity/trivy-action@master
           with:
-            image-ref: "devops-tools:$GITHUB_REF_NAME"
+            image-ref: "devopsteamelt/devops-tools:latest"
             format: 'sarif'
             output: 'trivy-results.sarif'
             severity: 'CRITICAL,HIGH'
