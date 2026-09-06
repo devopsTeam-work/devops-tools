@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - '*'   # Matches any tag
+permissions:
+  contents: read
+  security-events: write
+  
 jobs:
 
   build:
