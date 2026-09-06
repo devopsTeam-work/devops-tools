@@ -12,6 +12,10 @@ ARG DIND_TAG=28.5-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.14.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.9
 
+# Create an alias for the dind image so we can copy from it later 
+# without scoping issues with ARGs.
+FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
+
 # ==========================================================
 # Stage 1: Binaries Downloader & Builder
 # ==========================================================
@@ -123,7 +127,7 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 # PRESERVE DIND CAPABILITIES:
 # Copy statically compiled Docker daemon, cli and scripts directly from official dind.
 # ----------------------------------------------------------
-COPY --from=${REGISTRY}/library/docker:${DIND_TAG} /usr/local/bin/ /usr/local/bin/
+COPY --from=dind /usr/local/bin/ /usr/local/bin/
 
 # Copy external binary tools
 COPY --from=quay.io/helmpack/chart-testing:v3.14.0 /usr/local/bin/ct /usr/local/bin/ct
