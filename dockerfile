@@ -195,7 +195,7 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
     done
 
 # ---------- Helm plugins ----------
-RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.1.2 && \
+RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.0.3 && \
     helm plugin install https://github.com/C123R/helm-blob.git && \
     helm plugin install https://github.com/databus23/helm-diff --version v3.15.12 && \
     helm plugin install https://github.com/idsulik/helm-cel && \
