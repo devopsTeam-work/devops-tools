@@ -52,10 +52,7 @@ ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-ti
 
 RUN mkdir -p /out/bin /out/jfr
 
-# 1. ORAS
-RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-    curl ${CURL_OPTS} "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" \
-      | tar -xz -C /out/bin oras
+
 
 # 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
@@ -71,44 +68,36 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
       "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/${JFROG_CLI_VERSION}/jfrog-cli-linux-${ARCH}/jf"
 
 # 5. Rancher CLIs
-RUN for RV in ${RANCHER_VERSIONS}; do \
-        curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
-        mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
-        rm -rf /tmp/rancher-${RV}; \
-    done && \
-    cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
+#RUN for RV in ${RANCHER_VERSIONS}; do \
+#        curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
+#        mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
+#        rm -rf /tmp/rancher-${RV}; \
+#    done && \
+#    cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
 
-# 7. Helmify 
-RUN curl ${CURL_OPTS} "https://github.com/arttor/helmify/releases/download/v${HELMIFY_VERSION}/helmify_Linux_x86_64.tar.gz" \
-      | tar -xz -C /out/bin helmify
+
 
 # 8. Kubernetes tooling
-RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-    ARCH_RAW=$(uname -m) && \
-    curl ${CURL_OPTS} "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /out/bin kubeseal && \
-    curl ${CURL_OPTS} "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s && \
-    curl ${CURL_OPTS} -o /out/bin/argocd "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-${ARCH}" && \
-    curl ${CURL_OPTS} "https://github.com/stern/stern/releases/download/v${STERN_VERSION}/stern_${STERN_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin stern && \
-    curl ${CURL_OPTS} "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin kustomize && \
-    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubectx_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubectx && \
-    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens
+#RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+#    ARCH_RAW=$(uname -m) && \
+#    curl ${CURL_OPTS} "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /out/bin kubeseal && \
+#    curl ${CURL_OPTS} "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s && \
+#    curl ${CURL_OPTS} -o /out/bin/argocd "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-${ARCH}" && \
+#    curl ${CURL_OPTS} "https://github.com/stern/stern/releases/download/v${STERN_VERSION}/stern_${STERN_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin stern && \
+#    curl ${CURL_OPTS} "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin kustomize && \
+#    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubectx_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubectx && \
+#    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens
 
-# 9. Helm, Kubectl, yq (Moved from Alpine apk since they are not in Ubuntu apt repos)
+# 9. Kubectl, yq (Moved from Alpine apk since they are not in Ubuntu apt repos)
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-    curl ${CURL_OPTS} "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /tmp && \
-    mv /tmp/linux-${ARCH}/helm /out/bin/helm && \
-    rm -rf /tmp/linux-${ARCH} && \
     curl ${CURL_OPTS} -o /out/bin/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
     curl ${CURL_OPTS} -o /out/bin/yq "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${ARCH}"
 
 RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 
 # Sanity check
-RUN /out/bin/oras version >/dev/null && \
-    /out/bin/argocd version --client >/dev/null && \
-    /out/bin/kustomize version >/dev/null && \
+RUN /out/bin/kustomize version >/dev/null && \
     /out/bin/jf --version >/dev/null && \
-    /out/bin/helm version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
     /out/bin/yq --version >/dev/null
 
@@ -194,27 +183,6 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
         curl ${CURL_OPTS} -o "${JENKINS_HOME}/plugins/${name}.hpi" "$url"; \
     done
 
-# ---------- Helm plugins ----------
-RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.0.3 && \
-    helm plugin install https://github.com/C123R/helm-blob.git && \
-    helm plugin install https://github.com/databus23/helm-diff --version v3.15.12 && \
-    helm plugin install https://github.com/idsulik/helm-cel && \
-    helm plugin install https://github.com/vmware-labs/distribution-tooling-for-helm && \
-    helm plugin install https://github.com/adamreese/helm-env && \
-    helm plugin install https://github.com/adamreese/helm-last && \
-    helm plugin install https://github.com/adamreese/helm-local && \
-    helm plugin install https://github.com/jkroepke/helm-secrets --version v4.7.7 && \
-    helm plugin install https://github.com/adamreese/helm-nuke && \
-    helm plugin install https://github.com/ContainerSolutions/helm-monitor && \
-    helm plugin install https://github.com/hypnoglow/helm-s3.git --version v0.17.2 && \
-    helm plugin install https://github.com/dadav/helm-schema --version 0.23.5 && \
-    helm plugin install https://github.com/salesforce/helm-starter.git && \
-    helm plugin install https://github.com/hayorov/helm-gcs.git && \
-    helm plugin install https://github.com/karuppiah7890/helm-schema-gen.git && \
-    helm plugin install https://github.com/datreeio/helm-datree && \
-    helm plugin install https://github.com/JovianX/helm-release-plugin && \
-    helm plugin install https://github.com/seacrew/helm-compose && \
-    rm -rf ~/.cache/helm /tmp/*
 
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
