@@ -96,8 +96,7 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
 RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 
 # Sanity check
-RUN /out/bin/kustomize version >/dev/null && \
-    /out/bin/jf --version >/dev/null && \
+RUN /out/bin/jf --version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
     /out/bin/yq --version >/dev/null
 
