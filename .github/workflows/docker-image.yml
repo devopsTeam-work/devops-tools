@@ -2,8 +2,9 @@ name: Docker Image CI
 
 on:
   push:
+    branches: [ "**" ] # ירוץ על כל push בכל בראנץ'
     tags:
-      - '*'   # Matches any tag
+      - '*'
 permissions:
   contents: read
   security-events: write
