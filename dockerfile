@@ -39,6 +39,9 @@ ARG HELMIFY_VERSION=0.4.20
 ARG JFROG_CLI_VERSION=2.122.0
 ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
 ARG RANCHER_DEFAULT=v2.13.1
+ARG HELM_VERSION=3.15.2
+ARG KUBECTL_VERSION=1.30.2
+ARG YQ_VERSION=4.44.2
 
 # Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
@@ -50,7 +53,7 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" \
       | tar -xz -C /out/bin oras
 
-# 2. Jenkins CLI (jcli) — was "latest", now pinned
+# 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
       | tar -xz -C /out/bin
 
@@ -58,13 +61,12 @@ RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/downlo
 RUN curl ${CURL_OPTS} -o /tmp/jfr.zip "https://github.com/jenkinsci/jenkinsfile-runner/releases/download/${JFR_VERSION}/jenkinsfile-runner-${JFR_VERSION}.zip" && \
     unzip -q /tmp/jfr.zip -d /out/jfr && rm -f /tmp/jfr.zip
 
-# 4. JFrog CLI — was "curl https://getcli.jfrog.io/v2-jf | sh"
-#    Now a pinned artifact download; no remote script executed at build time.
+# 4. JFrog CLI 
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} -o /out/bin/jf \
       "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/${JFROG_CLI_VERSION}/jfrog-cli-linux-${ARCH}/jf"
 
-# 5. Rancher CLIs (relative symlink kept as-is)
+# 5. Rancher CLIs
 RUN for RV in ${RANCHER_VERSIONS}; do \
         curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
         mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
@@ -72,13 +74,11 @@ RUN for RV in ${RANCHER_VERSIONS}; do \
     done && \
     cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
 
-# 7. Helmify — was "latest", now pinned
+# 7. Helmify 
 RUN curl ${CURL_OPTS} "https://github.com/arttor/helmify/releases/download/v${HELMIFY_VERSION}/helmify_Linux_x86_64.tar.gz" \
       | tar -xz -C /out/bin helmify
 
 # 8. Kubernetes tooling
-#    kustomize: was "curl install_kustomize.sh | bash" from a moving master branch.
-#    Now a pinned release tarball — no remote script execution.
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     ARCH_RAW=$(uname -m) && \
     curl ${CURL_OPTS} "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /out/bin kubeseal && \
@@ -87,27 +87,45 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} "https://github.com/stern/stern/releases/download/v${STERN_VERSION}/stern_${STERN_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin stern && \
     curl ${CURL_OPTS} "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin kustomize && \
     curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubectx_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubectx && \
-    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens && \
-    chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
+    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens
 
-# Sanity check: every binary must actually execute before it ships
+# 9. Helm, Kubectl, yq (Moved from Alpine apk since they are not in Ubuntu apt repos)
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    curl ${CURL_OPTS} "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /tmp && \
+    mv /tmp/linux-${ARCH}/helm /out/bin/helm && \
+    rm -rf /tmp/linux-${ARCH} && \
+    curl ${CURL_OPTS} -o /out/bin/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
+    curl ${CURL_OPTS} -o /out/bin/yq "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${ARCH}"
+
+RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
+
+# Sanity check
 RUN /out/bin/oras version >/dev/null && \
     /out/bin/argocd version --client >/dev/null && \
     /out/bin/kustomize version >/dev/null && \
-    /out/bin/jf --version >/dev/null
+    /out/bin/jf --version >/dev/null && \
+    /out/bin/helm version >/dev/null && \
+    /out/bin/kubectl version --client >/dev/null && \
+    /out/bin/yq --version >/dev/null
 
 # ==========================================================
-# Stage 2: Final Production Image
+# Stage 2: Final Production Image (Ubuntu based for manylinux)
 # ==========================================================
-FROM ${REGISTRY}/library/docker:${DIND_TAG}
+FROM ${REGISTRY}/library/ubuntu:24.04
 
 LABEL org.opencontainers.image.title="devops-jenkinsfile-runner" \
       org.opencontainers.image.description="Jenkinsfile Runner + K8s/Helm/GitOps toolchain" \
-      org.opencontainers.image.base.name="docker:${DIND_TAG}"
+      org.opencontainers.image.base.name="ubuntu:24.04"
 
-SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
-# Copy external binary tools (both pinned — uv was ":latest")
+# ----------------------------------------------------------
+# PRESERVE DIND CAPABILITIES:
+# Copy statically compiled Docker daemon, cli and scripts directly from official dind.
+# ----------------------------------------------------------
+COPY --from=${REGISTRY}/library/docker:${DIND_TAG} /usr/local/bin/ /usr/local/bin/
+
+# Copy external binary tools
 COPY --from=quay.io/helmpack/chart-testing:v3.14.0 /usr/local/bin/ct /usr/local/bin/ct
 COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /bin/
 
@@ -115,24 +133,26 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /bin/
 COPY --from=builder /out/bin/ /usr/local/bin/
 COPY --from=builder /out/jfr /opt/jfr
 
-ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk \
+ENV JAVA_HOME=/usr \
     JENKINS_HOME=/opt/jenkins \
-    PATH="/opt/jfr/bin:/usr/lib/jvm/java-21-openjdk/bin:${PATH}" \
-    CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
+    PATH="/opt/jfr/bin:${PATH}" \
+    CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600" \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
-# Upgrade the base OS packages FIRST — this is what closes the openssl /
-# libcrypto3 / libssl3 / curl / libcurl / openssh / glib / musl / vim findings
-# that come from the docker:*-dind base layer.
-RUN apk upgrade --no-cache && \
-    apk add --no-cache --upgrade \
-    git git-lfs bash tcsh curl sudo python3 py3-pip iputils tcpdump \
-    helm kubectl wget skopeo zip util-linux jq vim nano \
-    yq podman podman-compose fuse-overlayfs openjdk21-jre unzip tar ttf-dejavu npm sshpass openssh && \
-    rm -rf /var/cache/apk/*
+# Install base OS packages via apt (Ubuntu). Includes DinD prerequisites.
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+    git git-lfs bash tcsh curl sudo python3 python3-pip python3-venv iputils-ping tcpdump \
+    wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
+    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server \
+    iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install Python and NPM packages, then clean cache immediately
-# --upgrade on pip/setuptools clears the old setuptools / urllib3 / certifi findings
-# inside each prefix.
+# Install Python and NPM packages
+# Thanks to Ubuntu's glibc, pip will now identify the system correctly and pull manylinux wheels!
 RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian --upgrade pip setuptools wheel && \
     uv pip install --system --no-cache --prefix=/opt/mcp-atlassian mcp-atlassian==0.23.1 && \
     uv pip install --system --no-cache --prefix=/opt/jenkins-mcp --upgrade pip setuptools wheel && \
@@ -143,14 +163,8 @@ RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian --upgrade pip
     rm -rf /root/.cache /root/.npm /tmp/*
 
 # ---------- Jenkins WAR + plugins ----------
-# Both were "latest" before: not reproducible, and impossible to control which
-# CVEs land in the image. Now driven by explicit versions.
-#
-# NOTE: set JENKINS_VERSION to the current LTS before building.
 ARG JENKINS_VERSION=2.568.2
 
-# Format per entry: <plugin-name>:<version>
-# "latest" still works, but pin each one to make the build reproducible.
 ARG JENKINS_PLUGINS="\
     workflow-aggregator:latest \
     workflow-job:latest \
@@ -177,7 +191,6 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
     done
 
 # ---------- Helm plugins ----------
-# Pinned where an upstream release tag exists; the rest are unchanged.
 RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.1.2 && \
     helm plugin install https://github.com/C123R/helm-blob.git && \
     helm plugin install https://github.com/databus23/helm-diff --version v3.15.12 && \
@@ -200,7 +213,7 @@ RUN helm plugin install https://github.com/helm-unittest/helm-unittest.git --ver
     rm -rf ~/.cache/helm /tmp/*
 
 # Final cleanup: no build caches, no leftover archives in the image
-RUN rm -rf /var/cache/apk/* /root/.cache /root/.npm /tmp/* /var/tmp/*
+RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
 WORKDIR /workspace
 
