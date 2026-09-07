@@ -6,21 +6,22 @@ on:
     tags:
       - '*'
 permissions:
-  contents: read
+  contents: write # שונה ל-write כדי לאפשר לדחוף ברנצ'ים וטאגים חדשים
   security-events: write
   
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
 
     steps:
         - name: show tag name
           run: echo "$GITHUB_REF_NAME"
+
         - name: Checkout code
           uses: actions/checkout@v4
-    
+          with:
+            fetch-depth: 0 # חשוב כדי שנוכל לייצר ברנצ'ים ולדחוף אותם
+
         - name: Set dynamic tag
           run: echo "TAG_DATE=$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
     
@@ -46,7 +47,7 @@ jobs:
         - name: Run Trivy Scanner (SARIF Output)
           uses: aquasecurity/trivy-action@master
           with:
-            image-ref: "devopsteamelt/devops-tools:latest"
+            image-ref: "${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest"
             format: 'sarif'
             output: 'trivy-results.sarif'
             severity: 'CRITICAL,HIGH'
@@ -55,3 +56,98 @@ jobs:
           uses: github/codeql-action/upload-sarif@v4
           with:
             sarif_file: 'trivy-results.sarif'
+
+        # ==========================================
+        # שלבי התיקון האוטומטי באמצעות Gemini API
+        # ==========================================
+
+        - name: Setup Python
+          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.10'
+
+        - name: Analyze with Gemini API and generate updated Dockerfile
+          # התנאי הזה מונע ריקורסיה - השלב לא ירוץ אם השם נגמר ב- gemini_scan_
+          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+          env:
+            GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          run: |
+            pip install google-generativeai
+            python - << 'EOF'
+            import os
+            import google.generativeai as genai
+
+            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+            model = genai.GenerativeModel('gemini-1.5-flash')
+
+            with open('Dockerfile', 'r') as f:
+                dockerfile = f.read()
+            with open('trivy-results.sarif', 'r') as f:
+                trivy_logs = f.read()
+
+            prompt = f"""
+            You are a DevOps expert. Review the following Dockerfile and the Trivy vulnerability SARIF logs.
+            Your task: Update the Dockerfile to mitigate the vulnerabilities BY ONLY CHANGING PACKAGE OR BASE IMAGE VERSIONS.
+            
+            CRITICAL RULES:
+            1. DO NOT change, add, or remove any logic, structure, or commands.
+            2. ONLY update version numbers of packages or base images mentioned in the vulnerabilities.
+            3. Reply with ONLY the raw content of the new Dockerfile. Do not include markdown blocks (like ```dockerfile) or any explanations.
+
+            Dockerfile:
+            {dockerfile}
+
+            Trivy Logs:
+            {trivy_logs}
+            """
+
+            response = model.generate_content(prompt)
+            output = response.text.strip()
+            
+            # ניקוי של סימני Markdown במידה והמודל החזיר אותם למרות ההוראות
+            if output.startswith("```"):
+                lines = output.split("\n")
+                output = "\n".join(lines[1:-1])
+
+            with open('Dockerfile.new', 'w') as f:
+                f.write(output)
+            EOF
+
+        - name: Diff, Commit and Push changes
+          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+          run: |
+            echo "=== Diff between Original and Gemini's Suggestion ==="
+            diff -u Dockerfile Dockerfile.new || true
+            
+            # אם הקבצים זהים, אין שינוי בגרסאות - סיום הריצה בהצלחה
+            if cmp -s Dockerfile Dockerfile.new; then
+              echo "No version updates suggested by Gemini. Exiting."
+              exit 0
+            fi
+            
+            # דריסת הקובץ הישן
+            mv Dockerfile.new Dockerfile
+            
+            # הגדרת משתמש Git (הבוט של GitHub Actions)
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            
+            NEW_REF="${GITHUB_REF_NAME}_gemini_scan"
+            
+            # לוגיקת Push (הפרדה בין Tag ל-Branch)
+            if [[ $GITHUB_REF == refs/tags/* ]]; then
+              echo "Triggered by Tag. Creating new branch and tag: $NEW_REF"
+              git checkout -b "$NEW_REF"
+              git add Dockerfile
+              git commit -m "chore: secure Dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
+              git push origin "$NEW_REF"
+              git tag "$NEW_REF"
+              git push origin "$NEW_REF"
+            else
+              echo "Triggered by Branch. Creating new branch: $NEW_REF"
+              git checkout -b "$NEW_REF"
+              git add Dockerfile
+              git commit -m "chore: secure Dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
+              git push origin "$NEW_REF"
+            fi
