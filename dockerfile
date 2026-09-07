@@ -8,9 +8,9 @@
 # ---------- Base images (override to point at Artifactory) ----------
 ARG REGISTRY=docker.io
 ARG ALPINE_TAG=3.22
-ARG DIND_TAG=28.0.1-dind
+ARG DIND_TAG=28.0.2-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.15.0
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.0
 
 # Create an alias for the dind image so we can copy from it later 
 # without scoping issues with ARGs.
@@ -44,15 +44,13 @@ ARG JFROG_CLI_VERSION=2.123.0
 ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
 ARG RANCHER_DEFAULT=v2.13.1
 ARG HELM_VERSION=3.18.10
-ARG KUBECTL_VERSION=1.31.0
+ARG KUBECTL_VERSION=1.31.5
 ARG YQ_VERSION=4.45.1
 
 # Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
 
 RUN mkdir -p /out/bin /out/jfr
-
-
 
 # 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
@@ -67,26 +65,7 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} -o /out/bin/jf \
       "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/${JFROG_CLI_VERSION}/jfrog-cli-linux-${ARCH}/jf"
 
-# 5. Rancher CLIs
-#RUN for RV in ${RANCHER_VERSIONS}; do \
-#        curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
-#        mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
-#        rm -rf /tmp/rancher-${RV}; \
-#    done && \
-#    cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
-
-
-
 # 8. Kubernetes tooling
-#RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-#    ARCH_RAW=$(uname -m) && \
-#    curl ${CURL_OPTS} "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /out/bin kubeseal && \
-#    curl ${CURL_OPTS} "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s && \
-#    curl ${CURL_OPTS} -o /out/bin/argocd "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-${ARCH}" && \
-#    curl ${CURL_OPTS} "https://github.com/stern/stern/releases/download/v${STERN_VERSION}/stern_${STERN_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin stern && \
-#    curl ${CURL_OPTS} "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /out/bin kustomize && \
-#    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubectx_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubectx && \
-#    curl ${CURL_OPTS} "https://github.com/ahmetb/kubectx/releases/download/v${KUBECTX_VERSION}/kubens_v${KUBECTX_VERSION}_linux_${ARCH_RAW}.tar.gz" | tar -xz -C /out/bin kubens
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s
 
@@ -119,9 +98,9 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 # ----------------------------------------------------------
 COPY --from=dind /usr/local/bin/ /usr/local/bin/
 
-# Copy external binary tools
-COPY --from=quay.io/helmpack/chart-testing:v3.14.0 /usr/local/bin/ct /usr/local/bin/ct
-COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /bin/
+# Copy external binary tools using parameterized ARGs
+COPY --from=${CT_IMAGE} /usr/local/bin/ct /usr/local/bin/ct
+COPY --from=${UV_IMAGE} /uv /bin/
 
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
@@ -146,7 +125,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python and NPM packages
-# Thanks to Ubuntu's glibc, pip will now identify the system correctly and pull manylinux wheels!
 RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian --upgrade pip setuptools wheel && \
     uv pip install --system --no-cache --prefix=/opt/mcp-atlassian mcp-atlassian==0.23.1 && \
     uv pip install --system --no-cache --prefix=/opt/jenkins-mcp --upgrade pip setuptools wheel && \
@@ -183,7 +161,6 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
         fi; \
         curl ${CURL_OPTS} -o "${JENKINS_HOME}/plugins/${name}.hpi" "$url"; \
     done
-
 
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
