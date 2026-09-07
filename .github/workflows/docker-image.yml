@@ -2,8 +2,13 @@ name: Docker Image CI
 
 on:
   push:
+    branches: [ "**" ] # ירוץ על כל push בכל בראנץ'
     tags:
-      - '*'   # Matches any tag
+      - '*'
+permissions:
+  contents: read
+  security-events: write
+  
 jobs:
 
   build:
@@ -33,6 +38,20 @@ jobs:
     
         # דחיפה (Push) של האימג' ל-Docker Hub
         - name: Push Docker image
+          if: startsWith(github.ref, 'refs/tags/')
           run: |
             docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:$GITHUB_REF_NAME
             docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest
+            
+        - name: Run Trivy Scanner (SARIF Output)
+          uses: aquasecurity/trivy-action@master
+          with:
+            image-ref: "devopsteamelt/devops-tools:latest"
+            format: 'sarif'
+            output: 'trivy-results.sarif'
+            severity: 'CRITICAL,HIGH'
+
+        - name: Upload Trivy Results to GitHub Security Tab
+          uses: github/codeql-action/upload-sarif@v4
+          with:
+            sarif_file: 'trivy-results.sarif'
