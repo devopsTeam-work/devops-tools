@@ -8,9 +8,9 @@
 # ---------- Base images (override to point at Artifactory) ----------
 ARG REGISTRY=docker.io
 ARG ALPINE_TAG=3.22
-ARG DIND_TAG=28.5-dind
-ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.14.0
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.9
+ARG DIND_TAG=28.0.1-dind
+ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.15.0
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
 
 # Create an alias for the dind image so we can copy from it later 
 # without scoping issues with ARGs.
@@ -33,19 +33,19 @@ WORKDIR /downloads
 ARG JFR_VERSION=1.0-beta-32
 ARG ORAS_VERSION=1.3.4
 ARG KUBESEAL_VERSION=0.39.1
-ARG K9S_VERSION=0.51.0
+ARG K9S_VERSION=0.52.0
 ARG ARGOCD_VERSION=2.13.9
 ARG STERN_VERSION=1.34.0
 ARG KUBECTX_VERSION=0.11.0
 ARG KUSTOMIZE_VERSION=5.8.1
 ARG JCLI_VERSION=0.0.47
 ARG HELMIFY_VERSION=0.4.20
-ARG JFROG_CLI_VERSION=2.122.0
+ARG JFROG_CLI_VERSION=2.123.0
 ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
 ARG RANCHER_DEFAULT=v2.13.1
 ARG HELM_VERSION=3.18.10
-ARG KUBECTL_VERSION=1.30.2
-ARG YQ_VERSION=4.44.2
+ARG KUBECTL_VERSION=1.31.0
+ARG YQ_VERSION=4.45.1
 
 # Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
