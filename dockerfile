@@ -19,7 +19,7 @@ ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
 # Named stages for every external image, so all of them are overridable for
 # the air-gapped build, e.g.:
 #   --build-arg REGISTRY=artifactory.corp/docker-remote \
-#   --build-arg CT_IMAGE=artifactory.corp/quay-remote/helmpack/chart-testing:v3.15.0 \
+#   --build-arg CT_IMAGE=artifactory.corp/quay-remote/helmpack/chart-testing:v3.14.0 \
 #   --build-arg UV_IMAGE=artifactory.corp/ghcr-remote/astral-sh/uv:0.12.11
 # For full reproducibility pin by digest instead of tag: docker:29.8.0-dind@sha256:...
 FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
