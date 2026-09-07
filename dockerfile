@@ -8,13 +8,23 @@
 # ---------- Base images (override to point at Artifactory) ----------
 ARG REGISTRY=docker.io
 ARG ALPINE_TAG=3.22
-ARG DIND_TAG=28.0.1-dind
+# 28.0.1 shipped dockerd/runc built with Go 1.23.6 -> 15 open stdlib CVEs in Trivy.
+# Needs a dind built with Go >= 1.24.9 (CVE-2025-58187 is the highest bar).
+# Avoid 29.7.0 (known archive-extraction regression). Verify the tag exists in
+# Artifactory and re-scan before locking. Conservative alt: ARG DIND_TAG=28.5.2-dind
+ARG DIND_TAG=29.8.0-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.15.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
 
-# Create an alias for the dind image so we can copy from it later 
-# without scoping issues with ARGs.
+# Named stages for every external image, so all of them are overridable for
+# the air-gapped build, e.g.:
+#   --build-arg REGISTRY=artifactory.corp/docker-remote \
+#   --build-arg CT_IMAGE=artifactory.corp/quay-remote/helmpack/chart-testing:v3.15.0 \
+#   --build-arg UV_IMAGE=artifactory.corp/ghcr-remote/astral-sh/uv:0.12.11
+# For full reproducibility pin by digest instead of tag: docker:29.8.0-dind@sha256:...
 FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
+FROM ${CT_IMAGE} AS ct
+FROM ${UV_IMAGE} AS uv
 
 # ==========================================================
 # Stage 1: Binaries Downloader & Builder
@@ -90,6 +100,12 @@ RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/k9s_Linux_${ARCH}.tar.gz" | tar -xz -C /out/bin k9s
 
+# 7. Helm (HELM_VERSION was declared but helm was never installed -- and `ct` needs it.
+#    Drop this block if leaving helm out was intentional.)
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    curl ${CURL_OPTS} "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${ARCH}.tar.gz" \
+      | tar -xz --strip-components=1 -C /out/bin "linux-${ARCH}/helm"
+
 # 9. Kubectl, yq (Moved from Alpine apk since they are not in Ubuntu apt repos)
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} -o /out/bin/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
@@ -100,6 +116,7 @@ RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 # Sanity check
 RUN /out/bin/jf --version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
+    /out/bin/helm version --short >/dev/null && \
     /out/bin/yq --version >/dev/null
 
 # ==========================================================
@@ -119,9 +136,10 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 # ----------------------------------------------------------
 COPY --from=dind /usr/local/bin/ /usr/local/bin/
 
-# Copy external binary tools
-COPY --from=quay.io/helmpack/chart-testing:v3.14.0 /usr/local/bin/ct /usr/local/bin/ct
-COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /bin/
+# Copy external binary tools (from the ARG-driven stages -- the hardcoded
+# quay.io/ghcr.io refs ignored ${CT_IMAGE}/${UV_IMAGE} and broke the air-gapped build)
+COPY --from=ct /usr/local/bin/ct /usr/local/bin/ct
+COPY --from=uv /uv /bin/
 
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
@@ -147,18 +165,21 @@ RUN apt-get update && \
 
 # Install Python and NPM packages
 # Thanks to Ubuntu's glibc, pip will now identify the system correctly and pull manylinux wheels!
-RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian --upgrade pip setuptools wheel && \
-    uv pip install --system --no-cache --prefix=/opt/mcp-atlassian mcp-atlassian==0.23.1 && \
-    uv pip install --system --no-cache --prefix=/opt/jenkins-mcp --upgrade pip setuptools wheel && \
+# uv resolves and installs on its own -- seeding pip/setuptools/wheel into these
+# prefixes was dead weight. `npm audit fix` was rewriting the pinned dependency
+# tree at build time and `|| true` swallowed every failure: both removed.
+RUN uv pip install --system --no-cache --prefix=/opt/mcp-atlassian mcp-atlassian==0.23.1 && \
     uv pip install --system --no-cache --prefix=/opt/jenkins-mcp mcp-jenkins==3.5.0 && \
     npm install -g --prefix=/opt/gitlab-mcp "@structured-world/gitlab-mcp@9.1.2" && \
-    npm audit fix --prefix=/opt/gitlab-mcp || true && \
     npm cache clean --force && \
     rm -rf /root/.cache /root/.npm /tmp/*
 
 # ---------- Jenkins WAR + plugins ----------
 ARG JENKINS_VERSION=2.568.2
 
+# TODO: replace every `:latest` with the exact version from /opt/jenkins/plugins.lock
+# (written by the build below). `:latest` makes this image non-reproducible and
+# is an unreviewed supply-chain entry point in an image labelled "Hardened".
 ARG JENKINS_PLUGINS="\
     workflow-aggregator:latest \
     workflow-job:latest \
@@ -182,7 +203,13 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
             url="https://updates.jenkins.io/download/plugins/${name}/${ver}/${name}.hpi"; \
         fi; \
         curl ${CURL_OPTS} -o "${JENKINS_HOME}/plugins/${name}.hpi" "$url"; \
-    done
+    done && \
+    for f in ${JENKINS_HOME}/plugins/*.hpi; do \
+        n=$(basename "$f" .hpi); \
+        v=$(unzip -p "$f" META-INF/MANIFEST.MF | tr -d '\r' | awk -F': ' '/^Plugin-Version:/{print $2}'); \
+        echo "${n}:${v}"; \
+    done > ${JENKINS_HOME}/plugins.lock && \
+    cat ${JENKINS_HOME}/plugins.lock
 
 
 # Final cleanup: no build caches, no leftover archives in the image
