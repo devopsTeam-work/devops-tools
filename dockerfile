@@ -12,9 +12,10 @@ ARG DIND_TAG=28.0.2-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.15.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.0
 
-# Create an alias for the dind image so we can copy from it later 
-# without scoping issues with ARGs.
+# Define named aliases for multi-stage COPY support
 FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
+FROM ${CT_IMAGE} AS ct_stage
+FROM ${UV_IMAGE} AS uv_stage
 
 # ==========================================================
 # Stage 1: Binaries Downloader & Builder
@@ -98,9 +99,9 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 # ----------------------------------------------------------
 COPY --from=dind /usr/local/bin/ /usr/local/bin/
 
-# Copy external binary tools using parameterized ARGs
-COPY --from=${CT_IMAGE} /usr/local/bin/ct /usr/local/bin/ct
-COPY --from=${UV_IMAGE} /uv /bin/
+# Copy external binary tools using named stage aliases
+COPY --from=ct_stage /usr/local/bin/ct /usr/local/bin/ct
+COPY --from=uv_stage /uv /bin/
 
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
