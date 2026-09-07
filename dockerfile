@@ -55,7 +55,7 @@ ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
 ARG RANCHER_DEFAULT=v2.13.1
 ARG HELM_VERSION=3.21.4
 ARG KUBECTL_VERSION=1.31.0
-ARG YQ_VERSION=4.45.1
+ARG YQ_VERSION=4.53.4
 
 # Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
