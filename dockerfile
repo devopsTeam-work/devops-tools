@@ -14,13 +14,13 @@ ARG ALPINE_TAG=3.22
 # Artifactory and re-scan before locking. Conservative alt: ARG DIND_TAG=28.5.2-dind
 ARG DIND_TAG=29.8.0-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.14.0
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.10
 
 # Named stages for every external image, so all of them are overridable for
 # the air-gapped build, e.g.:
 #   --build-arg REGISTRY=artifactory.corp/docker-remote \
 #   --build-arg CT_IMAGE=artifactory.corp/quay-remote/helmpack/chart-testing:v3.14.0 \
-#   --build-arg UV_IMAGE=artifactory.corp/ghcr-remote/astral-sh/uv:0.12.11
+#   --build-arg UV_IMAGE=artifactory.corp/ghcr-remote/astral-sh/uv:0.12.10
 # For full reproducibility pin by digest instead of tag: docker:29.8.0-dind@sha256:...
 FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
 FROM ${CT_IMAGE} AS ct
