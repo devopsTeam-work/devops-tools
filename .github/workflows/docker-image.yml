@@ -81,7 +81,7 @@ jobs:
             genai.configure(api_key=os.environ["GEMINI_API_KEY"])
             model = genai.GenerativeModel('gemini-3.6-flash')
 
-            with open('Dockerfile', 'r') as f:
+            with open('dockerfile', 'r') as f:
                 dockerfile = f.read()
             with open('trivy-results.sarif', 'r') as f:
                 trivy_logs = f.read()
