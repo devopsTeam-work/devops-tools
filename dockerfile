@@ -13,7 +13,7 @@ ARG ALPINE_TAG=3.22
 # Avoid 29.7.0 (known archive-extraction regression). Verify the tag exists in
 # Artifactory and re-scan before locking. Conservative alt: ARG DIND_TAG=28.5.2-dind
 ARG DIND_TAG=29.8.0-dind
-ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.15.0
+ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.14.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.11
 
 # Named stages for every external image, so all of them are overridable for
