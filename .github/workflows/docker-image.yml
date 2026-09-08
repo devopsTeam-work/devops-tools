@@ -103,6 +103,13 @@ jobs:
             # הגבלת עד 50 הפגיעויות הראשונות כדי להבטיח Prompt קומפקטי
             vuln_text = "\n".join(vulnerabilities_summary[:50]) if vulnerabilities_summary else "No critical vulnerabilities found."
 
+            # === הדפסת הטקסט שנשלח לג'מיני לתוך ה-Logs של ה-Runner ===
+            print("==================================================")
+            print("=== Vulnerabilities Summary Sent to Gemini API ===")
+            print("==================================================")
+            print(vuln_text)
+            print("==================================================\n")
+
             prompt = f"""
             You are a DevOps expert. Review the following Dockerfile and Trivy vulnerabilities summary.
             Your task: Update the Dockerfile to mitigate the vulnerabilities BY ONLY CHANGING PACKAGE OR BASE IMAGE VERSIONS.
