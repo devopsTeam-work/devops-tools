@@ -118,7 +118,7 @@ jobs:
             1. DO NOT change, add, or remove any logic, structure, or commands.
             2. ONLY update version numbers of packages or base images mentioned in the vulnerabilities.
             3. Reply with ONLY the raw content of the new Dockerfile. Do not include markdown blocks (like ```dockerfile) or any explanations.
-
+            4. YOU HAVE TO CHECK AND VERIFY IN GOOGLE FOR EACH PACKAGAE THAT YOU DESIDE TO UPDATE THAT IS EXISTS AND FIXS THE PROBLEM
             Dockerfile:
             {dockerfile}
 
