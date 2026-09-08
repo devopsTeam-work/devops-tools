@@ -138,7 +138,7 @@ jobs:
                 lines = output.split("\n")
                 output = "\n".join(lines[1:-1])
 
-            with open('Dockerfile.new', 'w') as f:
+            with open('dockerfile.new', 'w') as f:
                 f.write(output)
             EOF
             
@@ -146,16 +146,16 @@ jobs:
           if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
           run: |
             echo "=== Diff between Original and Gemini's Suggestion ==="
-            diff -u Dockerfile Dockerfile.new || true
+            diff -u dockerfile dockerfile.new || true
             
             # 1. בדיקה אם קיימים שינויים בכלל - אם הקבצים זהים, נעצור ללא push
-            if cmp -s Dockerfile Dockerfile.new; then
+            if cmp -s dockerfile dockerfile.new; then
               echo "No version updates suggested by Gemini. Exiting."
               exit 0
             fi
             
             # 2. דריסת הקובץ המקורי עם ה-Dockerfile המעודכן
-            mv Dockerfile.new Dockerfile
+            mv dockerfile.new dockerfile
             
             # 3. הגדרת משתמש Git (הבוט של GitHub Actions)
             git config user.name "github-actions[bot]"
@@ -167,15 +167,15 @@ jobs:
             if [[ $GITHUB_REF == refs/tags/* ]]; then
               echo "Triggered by Tag. Creating new branch and tag: $NEW_REF"
               git checkout -b "$NEW_REF"
-              git add Dockerfile
-              git commit -m "chore: secure Dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
+              git add dockerfile
+              git commit -m "chore: secure dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
               git push origin "$NEW_REF"
               git tag "$NEW_REF"
               git push origin "$NEW_REF"
             else
               echo "Triggered by Branch. Creating new branch: $NEW_REF"
               git checkout -b "$NEW_REF"
-              git add Dockerfile
-              git commit -m "chore: secure Dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
+              git add dockerfile
+              git commit -m "chore: secure dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
               git push origin "$NEW_REF"
             fi
