@@ -82,10 +82,7 @@ jobs:
             from google.api_core.exceptions import ResourceExhausted
 
             genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel(
-                model_name='gemini-3.6-flash',
-                tools='google_search'
-            )
+            model = genai.GenerativeModel('gemini-3.6-flash')
             with open('dockerfile', 'r') as f:
                 dockerfile = f.read()
 
