@@ -68,19 +68,18 @@ jobs:
           with:
             python-version: '3.10'
 
-        - name: Analyze vulnerabilities with Gemini and generate Dockerfile updates
+        - name: Analyze vulnerabilities with Gemini
           if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
           env:
             GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           run: |
-            pip install -q google-genai packaging
+            pip install -q google-genai
         
             python -u - << 'EOF'
             import os
             import json
-            import re
             import time
-            from packaging.version import Version, InvalidVersion
+            import re
             from google import genai
             from google.genai.errors import APIError
         
@@ -90,250 +89,205 @@ jobs:
                 api_key=os.environ["GEMINI_API_KEY"]
             )
         
-            DOCKERFILE_PATH = "dockerfile"
-            SARIF_PATH = "trivy-results.sarif"
-            OUTPUT_PATH = "dockerfile.new"
-        
             # ------------------------------------------------------------
-            # 1. Read Dockerfile
+            # Read Dockerfile
             # ------------------------------------------------------------
         
-            with open(DOCKERFILE_PATH, "r") as f:
-                original_dockerfile = f.read()
+            with open("dockerfile", "r") as f:
+                dockerfile = f.read()
         
             # ------------------------------------------------------------
-            # 2. Parse Trivy SARIF
+            # Parse SARIF
             # ------------------------------------------------------------
         
-            vulnerabilities = []
+            findings = []
         
-            try:
-                with open(SARIF_PATH, "r") as f:
-                    sarif = json.load(f)
+            with open("trivy-results.sarif", "r") as f:
+                sarif = json.load(f)
         
-                for run in sarif.get("runs", []):
-                    rules = {}
+            for run in sarif.get("runs", []):
         
-                    for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
-                        rule_id = rule.get("id")
-                        properties = rule.get("properties", {}) or {}
+                rules = {}
         
-                        rules[rule_id] = {
-                            "severity": (
-                                properties.get("security-severity")
-                                or properties.get("severity")
-                                or ""
-                            )
-                        }
+                for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
+                    rule_id = rule.get("id")
         
-                    for result in run.get("results", []):
-                        rule_id = result.get("ruleId", "UNKNOWN")
-                        message = result.get("message", {}).get("text", "")
+                    properties = rule.get("properties", {}) or {}
         
-                        rule_info = rules.get(rule_id, {})
-        
-                        # Try to extract useful information from Trivy message
-                        installed_version = None
-                        fixed_version = None
-                        package = None
-        
-                        # Examples:
-                        # Installed Version: 1.2.3
-                        # Fixed Version: 1.2.4
-                        installed_match = re.search(
-                            r"Installed Version:\s*([^\s]+)",
-                            message,
-                            re.IGNORECASE
+                    rules[rule_id] = {
+                        "severity": (
+                            properties.get("severity")
+                            or properties.get("security-severity")
+                            or ""
                         )
+                    }
         
-                        fixed_match = re.search(
-                            r"Fixed Version:\s*([^\s]+)",
-                            message,
-                            re.IGNORECASE
-                        )
+                for result in run.get("results", []):
         
-                        package_match = re.search(
-                            r"Package:\s*([^\s]+)",
-                            message,
-                            re.IGNORECASE
-                        )
+                    rule_id = result.get("ruleId", "UNKNOWN")
         
-                        if installed_match:
-                            installed_version = installed_match.group(1)
+                    message = (
+                        result.get("message", {})
+                        .get("text", "")
+                    )
         
-                        if fixed_match:
-                            fixed_version = fixed_match.group(1)
+                    severity = rules.get(
+                        rule_id,
+                        {}
+                    ).get("severity", "")
         
-                        if package_match:
-                            package = package_match.group(1)
-        
-                        vulnerabilities.append({
-                            "rule_id": rule_id,
-                            "package": package,
-                            "installed": installed_version,
-                            "fixed": fixed_version,
-                            "severity": rule_info.get("severity", ""),
-                            "message": message
-                        })
-        
-            except Exception as e:
-                raise Exception(f"Failed to parse SARIF: {e}")
-        
-            print("==================================================")
-            print(f"Total Trivy findings: {len(vulnerabilities)}")
-            print("==================================================")
+                    findings.append({
+                        "cve": rule_id,
+                        "severity": severity,
+                        "message": message
+                    })
         
             # ------------------------------------------------------------
-            # 3. Remove duplicate findings
+            # Extract useful information from Trivy messages
+            # ------------------------------------------------------------
+        
+            compact = []
+        
+            for finding in findings:
+        
+                message = finding["message"]
+        
+                installed = None
+                fixed = None
+                package = None
+        
+                m = re.search(
+                    r"Package:\s*([^\s]+)",
+                    message,
+                    re.IGNORECASE
+                )
+        
+                if m:
+                    package = m.group(1)
+        
+                m = re.search(
+                    r"Installed Version:\s*([^\s]+)",
+                    message,
+                    re.IGNORECASE
+                )
+        
+                if m:
+                    installed = m.group(1)
+        
+                m = re.search(
+                    r"Fixed Version:\s*([^\s]+)",
+                    message,
+                    re.IGNORECASE
+                )
+        
+                if m:
+                    fixed = m.group(1)
+        
+                compact.append({
+                    "cve": finding["cve"],
+                    "severity": finding["severity"],
+                    "package": package,
+                    "installed_version": installed,
+                    "fixed_version": fixed
+                })
+        
+            # ------------------------------------------------------------
+            # Deduplicate
             # ------------------------------------------------------------
         
             unique = {}
         
-            for vuln in vulnerabilities:
+            for item in compact:
+        
                 key = (
-                    vuln.get("rule_id"),
-                    vuln.get("package"),
-                    vuln.get("installed"),
-                    vuln.get("fixed")
+                    item["cve"],
+                    item["package"],
+                    item["installed_version"],
+                    item["fixed_version"]
                 )
         
-                unique[key] = vuln
+                unique[key] = item
         
-            vulnerabilities = list(unique.values())
+            compact = list(unique.values())
         
-            print(f"Unique findings: {len(vulnerabilities)}")
-        
-            # ------------------------------------------------------------
-            # 4. Build compact representation for Gemini
-            #
-            # IMPORTANT:
-            # Do NOT send the entire Trivy message.
-            # Only send information Gemini actually needs.
-            # ------------------------------------------------------------
-        
-            compact_vulnerabilities = []
-        
-            for vuln in vulnerabilities:
-                compact_vulnerabilities.append({
-                    "cve": vuln["rule_id"],
-                    "package": vuln["package"],
-                    "installed_version": vuln["installed"],
-                    "fixed_version": vuln["fixed"],
-                    "severity": vuln["severity"]
-                })
-        
-            # Remove entries where we couldn't parse useful package info.
-            # Gemini can still reason about them if we provide the message,
-            # but only as a last resort.
-            compact_vulnerabilities = [
-                v for v in compact_vulnerabilities
-                if v["package"] or v["fixed_version"]
-            ]
+            print("==================================================")
+            print(f"Trivy findings: {len(findings)}")
+            print(f"Unique findings: {len(compact)}")
+            print("==================================================")
         
             # ------------------------------------------------------------
-            # 5. Group vulnerabilities by package
-            #
-            # Example:
-            #
-            # golang.org/x/crypto:
-            #   CVE-1 -> 0.55.0
-            #   CVE-2 -> 0.56.0
-            #
-            # Gemini only needs to decide the correct target version once.
+            # Gemini
             # ------------------------------------------------------------
-        
-            grouped = {}
-        
-            for vuln in compact_vulnerabilities:
-                package = vuln["package"] or "UNKNOWN"
-        
-                if package not in grouped:
-                    grouped[package] = {
-                        "installed_version": vuln["installed_version"],
-                        "fixed_versions": set(),
-                        "vulnerabilities": []
-                    }
-        
-                if vuln["fixed_version"]:
-                    grouped[package]["fixed_versions"].add(
-                        vuln["fixed_version"]
-                    )
-        
-                grouped[package]["vulnerabilities"].append({
-                    "cve": vuln["cve"],
-                    "fixed_version": vuln["fixed_version"],
-                    "severity": vuln["severity"]
-                })
-        
-            # Convert sets to lists for JSON
-            for package in grouped:
-                grouped[package]["fixed_versions"] = list(
-                    grouped[package]["fixed_versions"]
-                )
-        
-            # ------------------------------------------------------------
-            # 6. Prepare VERY SMALL Gemini request
-            # ------------------------------------------------------------
-        
-            package_data = []
-        
-            for package, data in grouped.items():
-                package_data.append({
-                    "package": package,
-                    "installed_version": data["installed_version"],
-                    "candidate_fixed_versions": data["fixed_versions"],
-                    "vulnerabilities": data["vulnerabilities"]
-                })
         
             prompt = f"""
             You are a Senior DevOps and Cyber Security Engineer.
             
-            Analyze the following Trivy vulnerability data.
+            Analyze the Trivy findings below and determine how each vulnerability
+            could be remediated.
             
-            Your ONLY task is to determine which package versions should be upgraded.
+            IMPORTANT:
             
-            STRICT RULES:
-        
-            1. Return ONLY valid JSON.
-            2. Do NOT return markdown.
-            3. Do NOT return the Dockerfile.
-            4. Do NOT suggest changing Dockerfile commands.
-            5. Do NOT suggest adding or removing packages.
-            6. Do NOT suggest changing environment variables.
-            7. Do NOT suggest changing application logic.
-            8. Only recommend version upgrades.
-            9. Prefer the smallest stable version that fixes all listed vulnerabilities.
-            10. Never recommend an EOL or short-lived OS release.
-            11. If multiple fixed versions are provided, select an appropriate stable version that fixes the vulnerabilities.
-            12. If no safe upgrade can be determined, do not invent a version.
-            13. The returned version must be a real existing version.
-            14. Preserve package compatibility whenever possible.
+            The vulnerable package may come from:
             
-            Return exactly this JSON structure:
+            1. Dockerfile
+            2. go.mod / Go dependency
+            3. base image
+            4. compiled binary
+            5. another dependency source
+            
+            DO NOT assume that every vulnerability can be fixed by changing
+            the Dockerfile.
+            
+            For every package, determine the most likely source.
+            
+            Allowed source values:
+            
+            - "dockerfile"
+            - "go.mod"
+            - "base_image"
+            - "binary"
+            - "unknown"
+            
+            Rules:
+            
+            1. Only recommend real, stable versions.
+            2. Never invent versions.
+            3. Prefer the smallest stable version that fixes the vulnerabilities.
+            4. Preserve compatibility.
+            5. If the vulnerability is inside a compiled binary and cannot safely
+               be changed directly from the Dockerfile, mark source as "binary".
+            6. If there is not enough information to determine the source,
+               mark source as "unknown".
+            7. Do not return a Dockerfile.
+            8. Do not return markdown.
+            9. Return ONLY valid JSON.
+            
+            Return exactly:
             
             {{
               "updates": [
                 {{
                   "package": "package-name",
-                  "from_version": "current-version",
-                  "to_version": "target-version",
-                  "reason": "short reason"
+                  "installed_version": "current",
+                  "target_version": "target",
+                  "source": "dockerfile|go.mod|base_image|binary|unknown",
+                  "confidence": "high|medium|low",
+                  "reason": "short explanation"
                 }}
               ]
             }}
             
-            Vulnerability data:
+            Trivy findings:
             
-            {json.dumps(package_data, indent=2)}
+            {json.dumps(compact, indent=2)}
             """
         
             print("==================================================")
-            print("Sending compact vulnerability data to Gemini")
-            print(f"Packages sent: {len(package_data)}")
+            print("Sending vulnerability metadata to Gemini")
             print("==================================================")
         
             # ------------------------------------------------------------
-            # 7. Count tokens BEFORE sending
+            # Token count
             # ------------------------------------------------------------
         
             try:
@@ -342,20 +296,26 @@ jobs:
                     contents=prompt
                 )
         
-                print(f"Gemini input tokens: {token_count.total_tokens}")
+                print(
+                    f"Gemini input tokens: "
+                    f"{token_count.total_tokens}"
+                )
         
             except Exception as e:
-                print(f"Warning: Could not count tokens: {e}")
+                print(
+                    f"Could not calculate token count: {e}"
+                )
         
             # ------------------------------------------------------------
-            # 8. Ask Gemini for JSON patch
+            # Call Gemini
             # ------------------------------------------------------------
         
-            updates = []
+            result = None
         
             for attempt in range(4):
         
                 try:
+        
                     response = client.models.generate_content(
                         model=MODEL,
                         contents=prompt,
@@ -365,266 +325,330 @@ jobs:
                         }
                     )
         
-                    raw = response.text.strip()
-        
-                    print("==================================================")
-                    print("Gemini response:")
-                    print(raw)
-                    print("==================================================")
-        
-                    parsed = json.loads(raw)
-        
-                    updates = parsed.get("updates", [])
-        
-                    if not isinstance(updates, list):
-                        raise ValueError("Gemini returned invalid 'updates' format")
-        
-                    print(f"Gemini recommended {len(updates)} package updates.")
-        
-                    if hasattr(response, "usage_metadata"):
-                        print("Gemini usage:")
-                        print(response.usage_metadata)
+                    result = json.loads(
+                        response.text
+                    )
         
                     break
         
                 except APIError as e:
-                    wait_time = (attempt + 1) * 40
+        
+                    wait = (attempt + 1) * 40
         
                     print(
                         f"Gemini API error: {e}"
                     )
         
                     print(
-                        f"Retrying in {wait_time}s "
-                        f"(attempt {attempt + 1}/4)..."
+                        f"Retrying in {wait}s..."
                     )
         
-                    time.sleep(wait_time)
-        
-                except json.JSONDecodeError as e:
-                    print(f"Gemini returned invalid JSON: {e}")
-                    print(raw)
-        
-                    if attempt == 3:
-                        raise
-        
-                    time.sleep(10)
+                    time.sleep(wait)
         
                 except Exception as e:
-                    print(f"Unexpected Gemini error: {e}")
+        
+                    print(
+                        f"Gemini error: {e}"
+                    )
         
                     if attempt == 3:
                         raise
         
                     time.sleep(15)
         
-            # ------------------------------------------------------------
-            # 9. Validate Gemini output
-            # ------------------------------------------------------------
+            if not result:
+                raise Exception(
+                    "Gemini did not return a valid response"
+                )
         
-            valid_updates = []
+            updates = result.get("updates", [])
+        
+            print("==================================================")
+            print("Gemini recommendations")
+            print("==================================================")
         
             for update in updates:
         
-                package = update.get("package")
-                from_version = update.get("from_version")
-                to_version = update.get("to_version")
+                print(
+                    f'{update.get("package")}: '
+                    f'{update.get("installed_version")} -> '
+                    f'{update.get("target_version")} '
+                    f'[{update.get("source")}]'
+                )
         
-                if not package or not to_version:
-                    print(
-                        f"Skipping invalid update: {update}"
-                    )
-                    continue
+            # ------------------------------------------------------------
+            # Save Gemini result
+            # ------------------------------------------------------------
         
-                # Prevent obvious prompt/model garbage
-                if any(
-                    bad in str(to_version).lower()
-                    for bad in [
-                        "latest",
-                        "unknown",
-                        "n/a",
-                        "none",
-                        "null"
-                    ]
-                ):
-                    print(
-                        f"Skipping suspicious version: {update}"
-                    )
-                    continue
+            with open(
+                "gemini-updates.json",
+                "w"
+            ) as f:
         
-                valid_updates.append({
-                    "package": package,
-                    "from_version": from_version,
-                    "to_version": to_version,
-                    "reason": update.get("reason", "")
-                })
+                json.dump(
+                    result,
+                    f,
+                    indent=2
+                )
         
             print("==================================================")
-            print("Validated updates")
-            print("==================================================")
-        
-            for update in valid_updates:
-                print(
-                    f'{update["package"]}: '
-                    f'{update["from_version"]} -> '
-                    f'{update["to_version"]}'
-                )
-        
-            # ------------------------------------------------------------
-            # 10. Apply updates LOCALLY
-            #
-            # IMPORTANT:
-            # Gemini never touches the Dockerfile.
-            #
-            # We only replace explicit version strings.
-            # ------------------------------------------------------------
-        
-            updated_dockerfile = original_dockerfile
-        
-            for update in valid_updates:
-        
-                old_version = update["from_version"]
-                new_version = update["to_version"]
-        
-                if not old_version or not new_version:
-                    continue
-        
-                # Exact replacement only.
-                #
-                # Example:
-                #
-                # 0.50.0 -> 0.56.0
-                #
-                # We intentionally do NOT allow Gemini
-                # to modify arbitrary Dockerfile lines.
-                #
-        
-                escaped_old = re.escape(old_version)
-        
-                matches = re.findall(
-                    escaped_old,
-                    updated_dockerfile
-                )
-        
-                if not matches:
-                    print(
-                        f'WARNING: Version "{old_version}" '
-                        f'not found in Dockerfile for {update["package"]}'
-                    )
-                    continue
-        
-                print(
-                    f'Replacing {old_version} -> {new_version} '
-                    f'for {update["package"]}'
-                )
-        
-                updated_dockerfile = re.sub(
-                    escaped_old,
-                    new_version,
-                    updated_dockerfile
-                )
-        
-            # ------------------------------------------------------------
-            # 11. Safety check
-            #
-            # Make sure Dockerfile structure wasn't changed.
-            # ------------------------------------------------------------
-        
-            original_lines = original_dockerfile.splitlines()
-            updated_lines = updated_dockerfile.splitlines()
-        
-            if len(original_lines) != len(updated_lines):
-                raise Exception(
-                    "SAFETY CHECK FAILED: "
-                    "Number of Dockerfile lines changed!"
-                )
-        
-            # Compare each line after removing version numbers.
-            # This allows version changes but catches structural changes.
-        
-            VERSION_PATTERN = re.compile(
-                r"""
-                (?:
-                    \d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?
-                |
-                    \d+\.\d+(?:[-+][A-Za-z0-9.-]+)?
-                )
-                """,
-                re.VERBOSE
+            print(
+                f"Gemini suggested {len(updates)} updates"
             )
-        
-            for line_number, (before, after) in enumerate(
-                zip(original_lines, updated_lines),
-                start=1
-            ):
-        
-                normalized_before = VERSION_PATTERN.sub(
-                    "<VERSION>",
-                    before
-                )
-        
-                normalized_after = VERSION_PATTERN.sub(
-                    "<VERSION>",
-                    after
-                )
-        
-                if normalized_before != normalized_after:
-                    raise Exception(
-                        f"SAFETY CHECK FAILED: "
-                        f"Dockerfile line {line_number} changed "
-                        f"beyond version modification.\n"
-                        f"BEFORE: {before}\n"
-                        f"AFTER:  {after}"
-                    )
-        
-            # ------------------------------------------------------------
-            # 12. Write result
-            # ------------------------------------------------------------
-        
-            with open(OUTPUT_PATH, "w") as f:
-                f.write(updated_dockerfile)
-        
-            print("==================================================")
-            print("SUCCESS")
-            print(f"Updated Dockerfile written to: {OUTPUT_PATH}")
+            print(
+                "Saved to gemini-updates.json"
+            )
             print("==================================================")
         
             EOF
             
-        - name: Diff, Commit and Push changes
+        - name: Apply Gemini Dockerfile updates
+          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+          run: |
+            python -u - << 'EOF'
+            import json
+            import re
+        
+            DOCKERFILE = "dockerfile"
+            NEW_DOCKERFILE = "dockerfile.new"
+        
+            with open(DOCKERFILE, "r") as f:
+                original = f.read()
+        
+            with open("gemini-updates.json", "r") as f:
+                data = json.load(f)
+        
+            updates = data.get("updates", [])
+        
+            print("==================================================")
+            print("Applying Gemini recommendations")
+            print("==================================================")
+        
+            print(
+                f"Total Gemini recommendations: "
+                f"{len(updates)}"
+            )
+        
+            dockerfile_updates = [
+                u for u in updates
+                if u.get("source") == "dockerfile"
+            ]
+        
+            print(
+                f"Dockerfile updates: "
+                f"{len(dockerfile_updates)}"
+            )
+        
+            updated = original
+        
+            applied = []
+            skipped = []
+        
+            for update in dockerfile_updates:
+        
+                package = update.get("package")
+                old = update.get("installed_version")
+                new = update.get("target_version")
+        
+                if not old or not new:
+        
+                    skipped.append({
+                        "package": package,
+                        "reason": "Missing version"
+                    })
+        
+                    continue
+        
+                # Exact version match
+                pattern = re.escape(old)
+        
+                matches = list(
+                    re.finditer(
+                        pattern,
+                        updated
+                    )
+                )
+        
+                if not matches:
+        
+                    print(
+                        f'WARNING: Version "{old}" not found '
+                        f'in Dockerfile for {package}'
+                    )
+        
+                    skipped.append({
+                        "package": package,
+                        "old": old,
+                        "new": new,
+                        "reason": "Version not found in Dockerfile"
+                    })
+        
+                    continue
+        
+                if len(matches) > 1:
+        
+                    print(
+                        f'WARNING: Version "{old}" appears '
+                        f'{len(matches)} times for {package}'
+                    )
+        
+                    skipped.append({
+                        "package": package,
+                        "old": old,
+                        "new": new,
+                        "reason": "Version appears multiple times"
+                    })
+        
+                    continue
+        
+                updated = re.sub(
+                    pattern,
+                    new,
+                    updated,
+                    count=1
+                )
+        
+                applied.append({
+                    "package": package,
+                    "old": old,
+                    "new": new
+                })
+        
+                print(
+                    f"✓ {package}: "
+                    f"{old} -> {new}"
+                )
+        
+            # ------------------------------------------------------------
+            # Save result
+            # ------------------------------------------------------------
+        
+            with open(
+                NEW_DOCKERFILE,
+                "w"
+            ) as f:
+        
+                f.write(updated)
+        
+            # ------------------------------------------------------------
+            # Summary
+            # ------------------------------------------------------------
+        
+            print("")
+            print("==================================================")
+            print("UPDATE SUMMARY")
+            print("==================================================")
+        
+            print(
+                f"Gemini recommendations : {len(updates)}"
+            )
+        
+            print(
+                f"Dockerfile candidates  : "
+                f"{len(dockerfile_updates)}"
+            )
+        
+            print(
+                f"Applied                 : "
+                f"{len(applied)}"
+            )
+        
+            print(
+                f"Skipped                 : "
+                f"{len(skipped)}"
+            )
+        
+            print("==================================================")
+        
+            if skipped:
+        
+                print("")
+                print("Skipped updates:")
+        
+                for item in skipped:
+                    print(
+                        f'- {item["package"]}: '
+                        f'{item["reason"]}'
+                    )
+        
+            EOF
+            
+        - name: Commit and push Gemini Dockerfile changes
           if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
           run: |
             echo "=== Diff between Original and Gemini's Suggestion ==="
+        
             diff -u dockerfile dockerfile.new || true
-            
-            # 1. בדיקה אם קיימים שינויים בכלל - אם הקבצים זהים, נעצור ללא push
+        
+            # ------------------------------------------------------------
+            # Check if Dockerfile actually changed
+            # ------------------------------------------------------------
+        
             if cmp -s dockerfile dockerfile.new; then
-              echo "No version updates suggested by Gemini. Exiting."
+        
+              echo "=================================================="
+              echo "No applicable Dockerfile changes."
+              echo "=================================================="
+        
+              if [[ -f gemini-updates.json ]]; then
+                echo "Gemini recommendations existed,"
+                echo "but none resulted in Dockerfile changes."
+              fi
+        
               exit 0
             fi
-            
-            # 2. דריסת הקובץ המקורי עם ה-Dockerfile המעודכן
+        
+            # ------------------------------------------------------------
+            # Replace Dockerfile
+            # ------------------------------------------------------------
+        
             mv dockerfile.new dockerfile
-            
-            # 3. הגדרת משתמש Git (הבוט של GitHub Actions)
+        
+            # ------------------------------------------------------------
+            # Git config
+            # ------------------------------------------------------------
+        
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            
+        
             NEW_REF="${GITHUB_REF_NAME}_gemini_scan"
-            
-            # 4. לוגיקת Push (הפרדה בין Push של Tag ל-Push של Branch)
-            if [[ $GITHUB_REF == refs/tags/* ]]; then
-              echo "Triggered by Tag. Creating new branch and tag: $NEW_REF"
+        
+            # ------------------------------------------------------------
+            # Push
+            # ------------------------------------------------------------
+        
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+        
+              echo "Triggered by Tag."
+              echo "Creating branch: $NEW_REF"
+        
               git checkout -b "$NEW_REF"
+        
               git add dockerfile
-              git commit -m "chore: secure dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
+        
+              git commit \
+                -m "chore: secure dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
+        
               git push origin "$NEW_REF"
+        
+              echo "Creating tag: $NEW_REF"
+        
               git tag "$NEW_REF"
+        
               git push origin "$NEW_REF"
+        
             else
-              echo "Triggered by Branch. Creating new branch: $NEW_REF"
+        
+              echo "Triggered by Branch."
+              echo "Creating branch: $NEW_REF"
+        
               git checkout -b "$NEW_REF"
+        
               git add dockerfile
-              git commit -m "chore: secure dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
+        
+              git commit \
+                -m "chore: secure dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
+        
               git push origin "$NEW_REF"
+        
             fi
