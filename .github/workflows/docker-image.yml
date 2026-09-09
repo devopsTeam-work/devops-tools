@@ -82,13 +82,12 @@ jobs:
             from google.api_core.exceptions import ResourceExhausted
 
             genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-3.6-flash')
-            with open('dockerfile', 'r') as f:
-                dockerfile = f.read()
+            model = genai.GenerativeModel('gemini-3.8-flash')
 
-            # 1. חילוץ תקציר הפגיעויות מתוך ה-SARIF בלבד (מניעת חריגת Tokens)
-            # 1. חילוץ כל הפגיעויות מתוך ה-SARIF
-            
+            with open('dockerfile', 'r') as f:
+                current_dockerfile = f.read()
+
+            # 1. חילוץ כל הפגיעויות מתוך ה-SARIF (ללא שום חיתוך)
             vulnerabilities_summary = []
             try:
                 with open('trivy-results.sarif', 'r') as f:
@@ -101,61 +100,92 @@ jobs:
             except Exception as e:
                 print(f"Warning: Could not parse SARIF file: {e}")
 
-            # הסרת כפילויות תוך שמירה על הסדר ושליחת הכל לסוכן
+            # הסרת כפילויות תוך שמירה על 100% מהמידע הייחודי
             unique_vulnerabilities = list(dict.fromkeys(vulnerabilities_summary))
-            vuln_text = "\n".join(unique_vulnerabilities) if unique_vulnerabilities else "No critical vulnerabilities found."
-           
-            # === הדפסת הטקסט שנשלח לג'מיני לתוך ה-Logs של ה-Runner ===
+            total_vulns = len(unique_vulnerabilities)
+
             print("==================================================")
-            print("=== Vulnerabilities Summary Sent to Gemini API ===")
-            print("==================================================")
-            print(vuln_text)
+            print(f"Total Unique Vulnerabilities to Process: {total_vulns}")
             print("==================================================\n")
 
-            prompt = f"""
-            You are a Senior DevOps & Cyber Security Engineer.
-            Your task: Update the provided Dockerfile to fix the reported Trivy vulnerabilities BY ONLY UPDATING PACKAGE OR BASE IMAGE VERSIONS.
+            if not unique_vulnerabilities:
+                unique_vulnerabilities = ["No critical vulnerabilities found."]
 
-            MANDATORY REAL-TIME VERIFICATION VIA GOOGLE SEARCH:
-            For EVERY package or base image version you decide to update, you MUST search the web in real-time to verify:
-            1. CVE REMEDIATION: Search the CVE/vulnerability database to confirm that the target version SPECIFICALLY fixes the reported vulnerability.
-            2. EXISTENCE IN REGISTRY: Confirm that the proposed version tag actually exists in the official repository (e.g., Docker Hub, Ubuntu APT, Alpine APK, GitHub Releases).
-            3. STABILITY & LTS: Confirm the version is an official STABLE / Long-Term Support (LTS) release. NEVER use short-term interim releases (e.g., Ubuntu 24.10, 23.10) that reach End-of-Life and fail `apt-get update`. Always stick to LTS versions (e.g., Ubuntu 24.04, 22.04, or `latest`).
+            # 2. חלוקה למנות (Chunks) של 40 פגיעויות לסבב
+            CHUNK_SIZE = 40
+            chunks = [unique_vulnerabilities[i:i + CHUNK_SIZE] for i in range(0, len(unique_vulnerabilities), CHUNK_SIZE)]
+            total_chunks = len(chunks)
 
-            STRICT EXECUTION RULES:
-            - DO NOT alter, add, or delete any instructions, commands, logic, or environment variables in the Dockerfile.
-            - ONLY change version numbers/tags.
-            - Output ONLY the raw updated Dockerfile. Do NOT include markdown code fences (like ```dockerfile) or any explanations.
+            # 3. לולאת עיבוד בשלבים
+            for idx, chunk in enumerate(chunks, 1):
+                vuln_text = "\n".join(chunk)
+                print(f"--- Processing Batch {idx}/{total_chunks} ({len(chunk)} vulnerabilities) ---")
 
-            Dockerfile:
-            {dockerfile}
+                prompt = f"""
+                You are a Senior DevOps & Cyber Security Engineer.
+                Your task: Update the provided Dockerfile to fix the reported Trivy vulnerabilities BY ONLY UPDATING PACKAGE OR BASE IMAGE VERSIONS.
 
-            Vulnerabilities Summary:
-            {vuln_text}
-            """
+                STRICT VERSION & STABILITY RULES:
+                1. BASE IMAGE STABILITY:
+                   - You MUST ONLY use Long-Term Support (LTS) base images (e.g., `ubuntu:24.04`, `ubuntu:22.04`, or `ubuntu:latest`).
+                   - NEVER upgrade to non-LTS / short-term releases (such as Ubuntu 24.10, 23.10, 23.04) because they reach End-of-Life (EOL) quickly and break `apt-get update` with 404 errors.
+                   - For Alpine, Debian, or other OS base images, strictly use official stable/LTS tags.
+                2. PACKAGE UPDATES:
+                   - Ensure proposed package/image versions are real, existing, stable releases.
+                   - Ensure versions explicitly address and remediate the reported CVEs.
+                3. EXECUTION CONSTRAINTS:
+                   - DO NOT alter, add, or delete any instructions, commands, logic, or environment variables in the Dockerfile.
+                   - ONLY change version numbers/tags.
+                   - Output ONLY the raw updated Dockerfile. Do NOT include markdown code fences (like ```dockerfile) or any explanations.
 
-            
-            # 2. מנגנון ניסיונות חוזרים (Retry) במקרה של Rate Limit
-            output = ""
-            for attempt in range(3):
-                try:
-                    response = model.generate_content(prompt)
-                    output = response.text.strip()
-                    break
-                except ResourceExhausted:
-                    print(f"Rate limit hit. Retrying in 45 seconds (Attempt {attempt + 1}/3)...")
-                    time.sleep(45)
+                Current Dockerfile Stage:
+                {current_dockerfile}
 
-            if not output:
-                raise Exception("Failed to get response from Gemini API due to quota limits.")
+                Vulnerabilities to fix in this stage:
+                {vuln_text}
+                """
 
-            # ניקוי סימני Markdown במידה והוחזרו
-            if output.startswith("```"):
-                lines = output.split("\n")
-                output = "\n".join(lines[1:-1])
+                # מנגנון ניסיונות חוזרים עבור כל מנה
+                batch_success = False
+                for attempt in range(4):
+                    try:
+                        response = model.generate_content(prompt)
+                        output = response.text.strip()
 
+                        # ניקוי markdown במידה והוחזר
+                        if output.startswith("```"):
+                            lines = output.split("\n")
+                            output = "\n".join(lines[1:-1])
+
+                        if output:
+                            current_dockerfile = output
+                            batch_success = True
+                            print(f"✓ Batch {idx}/{total_chunks} completed successfully.")
+                            break
+
+                    except ResourceExhausted:
+                        wait_time = (attempt + 1) * 35
+                        print(f"Rate limit hit. Retrying Batch {idx} in {wait_time} seconds (Attempt {attempt + 1}/4)...")
+                        time.sleep(wait_time)
+                    except Exception as e:
+                        print(f"Error on Batch {idx}: {e}")
+                        time.sleep(10)
+
+                if not batch_success:
+                    raise Exception(f"Failed to process Batch {idx}/{total_chunks} due to API limits or errors.")
+
+                # השהיה מובנית בין סבבים למניעת הצפת ה-API (Rate Limit Cool-down)
+                if idx < total_chunks:
+                    print("Waiting 15 seconds before processing the next batch...")
+                    time.sleep(15)
+
+            # שמירת התוצאה הסופית לאחר שעברה את כל השלבים
             with open('dockerfile.new', 'w') as f:
-                f.write(output)
+                f.write(current_dockerfile)
+
+            print("\n==================================================")
+            print("Successfully processed ALL vulnerabilities across all batches!")
+            print("==================================================")
             EOF
             
         - name: Diff, Commit and Push changes
