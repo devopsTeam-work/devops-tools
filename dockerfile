@@ -26,6 +26,7 @@ FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
 FROM ${CT_IMAGE} AS ct
 FROM ${UV_IMAGE} AS uv
 
+
 # ==========================================================
 # Stage 1: Binaries Downloader & Builder
 # ==========================================================
