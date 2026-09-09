@@ -73,53 +73,56 @@ jobs:
           env:
             GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           run: |
-            pip install google-generativeai
+            pip install google-genai
             python - << 'EOF'
             import os
             import json
             import time
-            import google.generativeai as genai
-            from google.api_core.exceptions import ResourceExhausted
+            from google import genai
+            from google.genai.errors import APIError
 
-            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-3.8-flash')
+            # אתחול הלקוח עם הספרייה המודרנית google-genai
+            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
             with open('dockerfile', 'r') as f:
                 current_dockerfile = f.read()
 
-            # 1. חילוץ כל הפגיעויות מתוך ה-SARIF (ללא שום חיתוך)
-            vulnerabilities_summary = []
+            # 1. חילוץ וצימצום חכם של ה פגיעויות (Aggregation)
+            vuln_map = {}
             try:
                 with open('trivy-results.sarif', 'r') as f:
                     sarif_data = json.load(f)
                     for run in sarif_data.get('runs', []):
                         for result in run.get('results', []):
-                            rule_id = result.get('ruleId', '')
+                            rule_id = result.get('ruleId', 'UNKNOWN')
                             message = result.get('message', {}).get('text', '')
-                            vulnerabilities_summary.append(f"- {rule_id}: {message}")
+                            
+                            # קיבוץ לפי Rule ID למניעת כפילויות טוקנים
+                            if rule_id not in vuln_map:
+                                vuln_map[rule_id] = message
             except Exception as e:
                 print(f"Warning: Could not parse SARIF file: {e}")
 
-            # הסרת כפילויות תוך שמירה על 100% מהמידע הייחודי
-            unique_vulnerabilities = list(dict.fromkeys(vulnerabilities_summary))
-            total_vulns = len(unique_vulnerabilities)
+            # יצירת תמצית מרוכזת של כל הפגיעויות הייחודיות
+            aggregated_vulnerabilities = [f"- {rule_id}: {msg}" for rule_id, msg in vuln_map.items()]
+            total_unique = len(aggregated_vulnerabilities)
 
             print("==================================================")
-            print(f"Total Unique Vulnerabilities to Process: {total_vulns}")
+            print(f"Raw Vulnerabilities Parsed: {total_unique} Unique Rules/CVEs")
             print("==================================================\n")
 
-            if not unique_vulnerabilities:
-                unique_vulnerabilities = ["No critical vulnerabilities found."]
+            if not aggregated_vulnerabilities:
+                aggregated_vulnerabilities = ["No critical vulnerabilities found."]
 
-            # 2. חלוקה למנות (Chunks) של 40 פגיעויות לסבב
-            CHUNK_SIZE = 40
-            chunks = [unique_vulnerabilities[i:i + CHUNK_SIZE] for i in range(0, len(unique_vulnerabilities), CHUNK_SIZE)]
+            # 2. חלוקה למנות אופטימליות (30 פגיעויות ייחודיות למנה)
+            CHUNK_SIZE = 30
+            chunks = [aggregated_vulnerabilities[i:i + CHUNK_SIZE] for i in range(0, len(aggregated_vulnerabilities), CHUNK_SIZE)]
             total_chunks = len(chunks)
 
-            # 3. לולאת עיבוד בשלבים
+            # 3. לולאת עיבוד מול ה-API
             for idx, chunk in enumerate(chunks, 1):
                 vuln_text = "\n".join(chunk)
-                print(f"--- Processing Batch {idx}/{total_chunks} ({len(chunk)} vulnerabilities) ---")
+                print(f"--- Processing Batch {idx}/{total_chunks} ({len(chunk)} unique issue types) ---")
 
                 prompt = f"""
                 You are a Senior DevOps & Cyber Security Engineer.
@@ -145,14 +148,17 @@ jobs:
                 {vuln_text}
                 """
 
-                # מנגנון ניסיונות חוזרים עבור כל מנה
+                # ניסיונות חוזרים עם המתנה מדורגת
                 batch_success = False
                 for attempt in range(4):
                     try:
-                        response = model.generate_content(prompt)
+                        response = client.models.generate_content(
+                            model='gemini-3.6-flash',
+                            contents=prompt
+                        )
                         output = response.text.strip()
 
-                        # ניקוי markdown במידה והוחזר
+                        # ניקוי Markdown במידה והוחזר
                         if output.startswith("```"):
                             lines = output.split("\n")
                             output = "\n".join(lines[1:-1])
@@ -163,28 +169,27 @@ jobs:
                             print(f"✓ Batch {idx}/{total_chunks} completed successfully.")
                             break
 
-                    except ResourceExhausted:
-                        wait_time = (attempt + 1) * 35
-                        print(f"Rate limit hit. Retrying Batch {idx} in {wait_time} seconds (Attempt {attempt + 1}/4)...")
+                    except APIError as e:
+                        wait_time = (attempt + 1) * 40
+                        print(f"API Error / Quota hit: {e}. Retrying Batch {idx} in {wait_time}s (Attempt {attempt + 1}/4)...")
                         time.sleep(wait_time)
                     except Exception as e:
-                        print(f"Error on Batch {idx}: {e}")
-                        time.sleep(10)
+                        print(f"Unexpected error on Batch {idx}: {e}")
+                        time.sleep(15)
 
                 if not batch_success:
                     raise Exception(f"Failed to process Batch {idx}/{total_chunks} due to API limits or errors.")
 
-                # השהיה מובנית בין סבבים למניעת הצפת ה-API (Rate Limit Cool-down)
                 if idx < total_chunks:
-                    print("Waiting 15 seconds before processing the next batch...")
-                    time.sleep(15)
+                    print("Cooling down for 20 seconds to respect API rate limits...")
+                    time.sleep(20)
 
-            # שמירת התוצאה הסופית לאחר שעברה את כל השלבים
+            # שמירת הקובץ המעודכן
             with open('dockerfile.new', 'w') as f:
                 f.write(current_dockerfile)
 
             print("\n==================================================")
-            print("Successfully processed ALL vulnerabilities across all batches!")
+            print("Successfully processed ALL vulnerabilities!")
             print("==================================================")
             EOF
             
