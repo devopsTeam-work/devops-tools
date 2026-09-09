@@ -82,12 +82,16 @@ jobs:
             from google.api_core.exceptions import ResourceExhausted
 
             genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-3.6-flash')
-
+            model = genai.GenerativeModel(
+                model_name='gemini-3.6-flash',
+                tools='google_search'
+            )
             with open('dockerfile', 'r') as f:
                 dockerfile = f.read()
 
             # 1. חילוץ תקציר הפגיעויות מתוך ה-SARIF בלבד (מניעת חריגת Tokens)
+            # 1. חילוץ כל הפגיעויות מתוך ה-SARIF
+            
             vulnerabilities_summary = []
             try:
                 with open('trivy-results.sarif', 'r') as f:
@@ -100,9 +104,10 @@ jobs:
             except Exception as e:
                 print(f"Warning: Could not parse SARIF file: {e}")
 
-            # הגבלת עד 50 הפגיעויות הראשונות כדי להבטיח Prompt קומפקטי
-            vuln_text = "\n".join(vulnerabilities_summary[:50]) if vulnerabilities_summary else "No critical vulnerabilities found."
-
+            # הסרת כפילויות תוך שמירה על הסדר ושליחת הכל לסוכן
+            unique_vulnerabilities = list(dict.fromkeys(vulnerabilities_summary))
+            vuln_text = "\n".join(unique_vulnerabilities) if unique_vulnerabilities else "No critical vulnerabilities found."
+           
             # === הדפסת הטקסט שנשלח לג'מיני לתוך ה-Logs של ה-Runner ===
             print("==================================================")
             print("=== Vulnerabilities Summary Sent to Gemini API ===")
@@ -111,14 +116,20 @@ jobs:
             print("==================================================\n")
 
             prompt = f"""
-            You are a DevOps expert. Review the following Dockerfile and Trivy vulnerabilities summary.
-            Your task: Update the Dockerfile to mitigate the vulnerabilities BY ONLY CHANGING PACKAGE OR BASE IMAGE VERSIONS.
-            
-            CRITICAL RULES:
-            1. DO NOT change, add, or remove any logic, structure, or commands.
-            2. ONLY update version numbers of packages or base images mentioned in the vulnerabilities.
-            3. Reply with ONLY the raw content of the new Dockerfile. Do not include markdown blocks (like ```dockerfile) or any explanations.
-            4. YOU HAVE TO CHECK AND VERIFY IN GOOGLE FOR EACH PACKAGAE THAT YOU DESIDE TO UPDATE THAT IS EXISTS AND FIXS THE PROBLEM
+            You are a Senior DevOps & Cyber Security Engineer.
+            Your task: Update the provided Dockerfile to fix the reported Trivy vulnerabilities BY ONLY UPDATING PACKAGE OR BASE IMAGE VERSIONS.
+
+            MANDATORY REAL-TIME VERIFICATION VIA GOOGLE SEARCH:
+            For EVERY package or base image version you decide to update, you MUST search the web in real-time to verify:
+            1. CVE REMEDIATION: Search the CVE/vulnerability database to confirm that the target version SPECIFICALLY fixes the reported vulnerability.
+            2. EXISTENCE IN REGISTRY: Confirm that the proposed version tag actually exists in the official repository (e.g., Docker Hub, Ubuntu APT, Alpine APK, GitHub Releases).
+            3. STABILITY & LTS: Confirm the version is an official STABLE / Long-Term Support (LTS) release. NEVER use short-term interim releases (e.g., Ubuntu 24.10, 23.10) that reach End-of-Life and fail `apt-get update`. Always stick to LTS versions (e.g., Ubuntu 24.04, 22.04, or `latest`).
+
+            STRICT EXECUTION RULES:
+            - DO NOT alter, add, or delete any instructions, commands, logic, or environment variables in the Dockerfile.
+            - ONLY change version numbers/tags.
+            - Output ONLY the raw updated Dockerfile. Do NOT include markdown code fences (like ```dockerfile) or any explanations.
+
             Dockerfile:
             {dockerfile}
 
@@ -126,6 +137,7 @@ jobs:
             {vuln_text}
             """
 
+            
             # 2. מנגנון ניסיונות חוזרים (Retry) במקרה של Rate Limit
             output = ""
             for attempt in range(3):
