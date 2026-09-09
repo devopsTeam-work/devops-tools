@@ -68,129 +68,527 @@ jobs:
           with:
             python-version: '3.10'
 
-        - name: Analyze with Gemini API and generate updated Dockerfile
+        - name: Analyze vulnerabilities with Gemini and generate Dockerfile updates
           if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
           env:
             GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           run: |
-            pip install google-genai
+            pip install -q google-genai packaging
+        
             python -u - << 'EOF'
             import os
             import json
+            import re
             import time
+            from packaging.version import Version, InvalidVersion
             from google import genai
             from google.genai.errors import APIError
-
-            # אתחול הלקוח עם הספרייה המודרנית google-genai
-            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
-            with open('dockerfile', 'r') as f:
-                current_dockerfile = f.read()
-
-            # 1. חילוץ וצימצום חכם של ה פגיעויות (Aggregation)
-            vuln_map = {}
+        
+            MODEL = "gemini-3.6-flash"
+        
+            client = genai.Client(
+                api_key=os.environ["GEMINI_API_KEY"]
+            )
+        
+            DOCKERFILE_PATH = "dockerfile"
+            SARIF_PATH = "trivy-results.sarif"
+            OUTPUT_PATH = "dockerfile.new"
+        
+            # ------------------------------------------------------------
+            # 1. Read Dockerfile
+            # ------------------------------------------------------------
+        
+            with open(DOCKERFILE_PATH, "r") as f:
+                original_dockerfile = f.read()
+        
+            # ------------------------------------------------------------
+            # 2. Parse Trivy SARIF
+            # ------------------------------------------------------------
+        
+            vulnerabilities = []
+        
             try:
-                with open('trivy-results.sarif', 'r') as f:
-                    sarif_data = json.load(f)
-                    for run in sarif_data.get('runs', []):
-                        for result in run.get('results', []):
-                            rule_id = result.get('ruleId', 'UNKNOWN')
-                            message = result.get('message', {}).get('text', '')
-                            
-                            # קיבוץ לפי Rule ID למניעת כפילויות טוקנים
-                            if rule_id not in vuln_map:
-                                vuln_map[rule_id] = message
-            except Exception as e:
-                print(f"Warning: Could not parse SARIF file: {e}")
-
-            # יצירת תמצית מרוכזת של כל הפגיעויות הייחודיות
-            aggregated_vulnerabilities = [f"- {rule_id}: {msg}" for rule_id, msg in vuln_map.items()]
-            total_unique = len(aggregated_vulnerabilities)
-
-            print("==================================================")
-            print(f"Raw Vulnerabilities Parsed: {total_unique} Unique Rules/CVEs")
-            print("==================================================\n")
-
-            if not aggregated_vulnerabilities:
-                aggregated_vulnerabilities = ["No critical vulnerabilities found."]
-
-            # 2. חלוקה למנות אופטימליות (30 פגיעויות ייחודיות למנה)
-            CHUNK_SIZE = 30
-            chunks = [aggregated_vulnerabilities[i:i + CHUNK_SIZE] for i in range(0, len(aggregated_vulnerabilities), CHUNK_SIZE)]
-            total_chunks = len(chunks)
-
-            # 3. לולאת עיבוד מול ה-API
-            for idx, chunk in enumerate(chunks, 1):
-                vuln_text = "\n".join(chunk)
-                print(f"--- Processing Batch {idx}/{total_chunks} ({len(chunk)} unique issue types) ---")
-
-                prompt = f"""
-                You are a Senior DevOps & Cyber Security Engineer.
-                Your task: Update the provided Dockerfile to fix the reported Trivy vulnerabilities BY ONLY UPDATING PACKAGE OR BASE IMAGE VERSIONS.
-
-                STRICT VERSION & STABILITY RULES:
-                1. BASE IMAGE STABILITY:
-                   - You MUST ONLY use Long-Term Support (LTS) base images (e.g., `ubuntu:24.04`, `ubuntu:22.04`, or `ubuntu:latest`).
-                   - NEVER upgrade to non-LTS / short-term releases (such as Ubuntu 24.10, 23.10, 23.04) because they reach End-of-Life (EOL) quickly and break `apt-get update` with 404 errors.
-                   - For Alpine, Debian, or other OS base images, strictly use official stable/LTS tags.
-                2. PACKAGE UPDATES:
-                   - Ensure proposed package/image versions are real, existing, stable releases.
-                   - Ensure versions explicitly address and remediate the reported CVEs.
-                3. EXECUTION CONSTRAINTS:
-                   - DO NOT alter, add, or delete any instructions, commands, logic, or environment variables in the Dockerfile.
-                   - ONLY change version numbers/tags.
-                   - Output ONLY the raw updated Dockerfile. Do NOT include markdown code fences (like ```dockerfile) or any explanations.
-
-                Current Dockerfile Stage:
-                {current_dockerfile}
-
-                Vulnerabilities to fix in this stage:
-                {vuln_text}
-                """
-
-                # ניסיונות חוזרים עם המתנה מדורגת
-                batch_success = False
-                for attempt in range(4):
-                    try:
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=prompt
+                with open(SARIF_PATH, "r") as f:
+                    sarif = json.load(f)
+        
+                for run in sarif.get("runs", []):
+                    rules = {}
+        
+                    for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
+                        rule_id = rule.get("id")
+                        properties = rule.get("properties", {}) or {}
+        
+                        rules[rule_id] = {
+                            "severity": (
+                                properties.get("security-severity")
+                                or properties.get("severity")
+                                or ""
+                            )
+                        }
+        
+                    for result in run.get("results", []):
+                        rule_id = result.get("ruleId", "UNKNOWN")
+                        message = result.get("message", {}).get("text", "")
+        
+                        rule_info = rules.get(rule_id, {})
+        
+                        # Try to extract useful information from Trivy message
+                        installed_version = None
+                        fixed_version = None
+                        package = None
+        
+                        # Examples:
+                        # Installed Version: 1.2.3
+                        # Fixed Version: 1.2.4
+                        installed_match = re.search(
+                            r"Installed Version:\s*([^\s]+)",
+                            message,
+                            re.IGNORECASE
                         )
-                        output = response.text.strip()
-
-                        # ניקוי Markdown במידה והוחזר
-                        if output.startswith("```"):
-                            lines = output.split("\n")
-                            output = "\n".join(lines[1:-1])
-
-                        if output:
-                            current_dockerfile = output
-                            batch_success = True
-                            print(f"✓ Batch {idx}/{total_chunks} completed successfully.")
-                            break
-
-                    except APIError as e:
-                        wait_time = (attempt + 1) * 40
-                        print(f"API Error / Quota hit: {e}. Retrying Batch {idx} in {wait_time}s (Attempt {attempt + 1}/4)...")
-                        time.sleep(wait_time)
-                    except Exception as e:
-                        print(f"Unexpected error on Batch {idx}: {e}")
-                        time.sleep(15)
-
-                if not batch_success:
-                    raise Exception(f"Failed to process Batch {idx}/{total_chunks} due to API limits or errors.")
-
-                if idx < total_chunks:
-                    print("Cooling down for 20 seconds to respect API rate limits...")
-                    time.sleep(20)
-
-            # שמירת הקובץ המעודכן
-            with open('dockerfile.new', 'w') as f:
-                f.write(current_dockerfile)
-
-            print("\n==================================================")
-            print("Successfully processed ALL vulnerabilities!")
+        
+                        fixed_match = re.search(
+                            r"Fixed Version:\s*([^\s]+)",
+                            message,
+                            re.IGNORECASE
+                        )
+        
+                        package_match = re.search(
+                            r"Package:\s*([^\s]+)",
+                            message,
+                            re.IGNORECASE
+                        )
+        
+                        if installed_match:
+                            installed_version = installed_match.group(1)
+        
+                        if fixed_match:
+                            fixed_version = fixed_match.group(1)
+        
+                        if package_match:
+                            package = package_match.group(1)
+        
+                        vulnerabilities.append({
+                            "rule_id": rule_id,
+                            "package": package,
+                            "installed": installed_version,
+                            "fixed": fixed_version,
+                            "severity": rule_info.get("severity", ""),
+                            "message": message
+                        })
+        
+            except Exception as e:
+                raise Exception(f"Failed to parse SARIF: {e}")
+        
             print("==================================================")
+            print(f"Total Trivy findings: {len(vulnerabilities)}")
+            print("==================================================")
+        
+            # ------------------------------------------------------------
+            # 3. Remove duplicate findings
+            # ------------------------------------------------------------
+        
+            unique = {}
+        
+            for vuln in vulnerabilities:
+                key = (
+                    vuln.get("rule_id"),
+                    vuln.get("package"),
+                    vuln.get("installed"),
+                    vuln.get("fixed")
+                )
+        
+                unique[key] = vuln
+        
+            vulnerabilities = list(unique.values())
+        
+            print(f"Unique findings: {len(vulnerabilities)}")
+        
+            # ------------------------------------------------------------
+            # 4. Build compact representation for Gemini
+            #
+            # IMPORTANT:
+            # Do NOT send the entire Trivy message.
+            # Only send information Gemini actually needs.
+            # ------------------------------------------------------------
+        
+            compact_vulnerabilities = []
+        
+            for vuln in vulnerabilities:
+                compact_vulnerabilities.append({
+                    "cve": vuln["rule_id"],
+                    "package": vuln["package"],
+                    "installed_version": vuln["installed"],
+                    "fixed_version": vuln["fixed"],
+                    "severity": vuln["severity"]
+                })
+        
+            # Remove entries where we couldn't parse useful package info.
+            # Gemini can still reason about them if we provide the message,
+            # but only as a last resort.
+            compact_vulnerabilities = [
+                v for v in compact_vulnerabilities
+                if v["package"] or v["fixed_version"]
+            ]
+        
+            # ------------------------------------------------------------
+            # 5. Group vulnerabilities by package
+            #
+            # Example:
+            #
+            # golang.org/x/crypto:
+            #   CVE-1 -> 0.55.0
+            #   CVE-2 -> 0.56.0
+            #
+            # Gemini only needs to decide the correct target version once.
+            # ------------------------------------------------------------
+        
+            grouped = {}
+        
+            for vuln in compact_vulnerabilities:
+                package = vuln["package"] or "UNKNOWN"
+        
+                if package not in grouped:
+                    grouped[package] = {
+                        "installed_version": vuln["installed_version"],
+                        "fixed_versions": set(),
+                        "vulnerabilities": []
+                    }
+        
+                if vuln["fixed_version"]:
+                    grouped[package]["fixed_versions"].add(
+                        vuln["fixed_version"]
+                    )
+        
+                grouped[package]["vulnerabilities"].append({
+                    "cve": vuln["cve"],
+                    "fixed_version": vuln["fixed_version"],
+                    "severity": vuln["severity"]
+                })
+        
+            # Convert sets to lists for JSON
+            for package in grouped:
+                grouped[package]["fixed_versions"] = list(
+                    grouped[package]["fixed_versions"]
+                )
+        
+            # ------------------------------------------------------------
+            # 6. Prepare VERY SMALL Gemini request
+            # ------------------------------------------------------------
+        
+            package_data = []
+        
+            for package, data in grouped.items():
+                package_data.append({
+                    "package": package,
+                    "installed_version": data["installed_version"],
+                    "candidate_fixed_versions": data["fixed_versions"],
+                    "vulnerabilities": data["vulnerabilities"]
+                })
+        
+            prompt = f"""
+            You are a Senior DevOps and Cyber Security Engineer.
+            
+            Analyze the following Trivy vulnerability data.
+            
+            Your ONLY task is to determine which package versions should be upgraded.
+            
+            STRICT RULES:
+        
+            1. Return ONLY valid JSON.
+            2. Do NOT return markdown.
+            3. Do NOT return the Dockerfile.
+            4. Do NOT suggest changing Dockerfile commands.
+            5. Do NOT suggest adding or removing packages.
+            6. Do NOT suggest changing environment variables.
+            7. Do NOT suggest changing application logic.
+            8. Only recommend version upgrades.
+            9. Prefer the smallest stable version that fixes all listed vulnerabilities.
+            10. Never recommend an EOL or short-lived OS release.
+            11. If multiple fixed versions are provided, select an appropriate stable version that fixes the vulnerabilities.
+            12. If no safe upgrade can be determined, do not invent a version.
+            13. The returned version must be a real existing version.
+            14. Preserve package compatibility whenever possible.
+            
+            Return exactly this JSON structure:
+            
+            {{
+              "updates": [
+                {{
+                  "package": "package-name",
+                  "from_version": "current-version",
+                  "to_version": "target-version",
+                  "reason": "short reason"
+                }}
+              ]
+            }}
+            
+            Vulnerability data:
+            
+            {json.dumps(package_data, indent=2)}
+            """
+        
+            print("==================================================")
+            print("Sending compact vulnerability data to Gemini")
+            print(f"Packages sent: {len(package_data)}")
+            print("==================================================")
+        
+            # ------------------------------------------------------------
+            # 7. Count tokens BEFORE sending
+            # ------------------------------------------------------------
+        
+            try:
+                token_count = client.models.count_tokens(
+                    model=MODEL,
+                    contents=prompt
+                )
+        
+                print(f"Gemini input tokens: {token_count.total_tokens}")
+        
+            except Exception as e:
+                print(f"Warning: Could not count tokens: {e}")
+        
+            # ------------------------------------------------------------
+            # 8. Ask Gemini for JSON patch
+            # ------------------------------------------------------------
+        
+            updates = []
+        
+            for attempt in range(4):
+        
+                try:
+                    response = client.models.generate_content(
+                        model=MODEL,
+                        contents=prompt,
+                        config={
+                            "response_mime_type": "application/json",
+                            "temperature": 0
+                        }
+                    )
+        
+                    raw = response.text.strip()
+        
+                    print("==================================================")
+                    print("Gemini response:")
+                    print(raw)
+                    print("==================================================")
+        
+                    parsed = json.loads(raw)
+        
+                    updates = parsed.get("updates", [])
+        
+                    if not isinstance(updates, list):
+                        raise ValueError("Gemini returned invalid 'updates' format")
+        
+                    print(f"Gemini recommended {len(updates)} package updates.")
+        
+                    if hasattr(response, "usage_metadata"):
+                        print("Gemini usage:")
+                        print(response.usage_metadata)
+        
+                    break
+        
+                except APIError as e:
+                    wait_time = (attempt + 1) * 40
+        
+                    print(
+                        f"Gemini API error: {e}"
+                    )
+        
+                    print(
+                        f"Retrying in {wait_time}s "
+                        f"(attempt {attempt + 1}/4)..."
+                    )
+        
+                    time.sleep(wait_time)
+        
+                except json.JSONDecodeError as e:
+                    print(f"Gemini returned invalid JSON: {e}")
+                    print(raw)
+        
+                    if attempt == 3:
+                        raise
+        
+                    time.sleep(10)
+        
+                except Exception as e:
+                    print(f"Unexpected Gemini error: {e}")
+        
+                    if attempt == 3:
+                        raise
+        
+                    time.sleep(15)
+        
+            # ------------------------------------------------------------
+            # 9. Validate Gemini output
+            # ------------------------------------------------------------
+        
+            valid_updates = []
+        
+            for update in updates:
+        
+                package = update.get("package")
+                from_version = update.get("from_version")
+                to_version = update.get("to_version")
+        
+                if not package or not to_version:
+                    print(
+                        f"Skipping invalid update: {update}"
+                    )
+                    continue
+        
+                # Prevent obvious prompt/model garbage
+                if any(
+                    bad in str(to_version).lower()
+                    for bad in [
+                        "latest",
+                        "unknown",
+                        "n/a",
+                        "none",
+                        "null"
+                    ]
+                ):
+                    print(
+                        f"Skipping suspicious version: {update}"
+                    )
+                    continue
+        
+                valid_updates.append({
+                    "package": package,
+                    "from_version": from_version,
+                    "to_version": to_version,
+                    "reason": update.get("reason", "")
+                })
+        
+            print("==================================================")
+            print("Validated updates")
+            print("==================================================")
+        
+            for update in valid_updates:
+                print(
+                    f'{update["package"]}: '
+                    f'{update["from_version"]} -> '
+                    f'{update["to_version"]}'
+                )
+        
+            # ------------------------------------------------------------
+            # 10. Apply updates LOCALLY
+            #
+            # IMPORTANT:
+            # Gemini never touches the Dockerfile.
+            #
+            # We only replace explicit version strings.
+            # ------------------------------------------------------------
+        
+            updated_dockerfile = original_dockerfile
+        
+            for update in valid_updates:
+        
+                old_version = update["from_version"]
+                new_version = update["to_version"]
+        
+                if not old_version or not new_version:
+                    continue
+        
+                # Exact replacement only.
+                #
+                # Example:
+                #
+                # 0.50.0 -> 0.56.0
+                #
+                # We intentionally do NOT allow Gemini
+                # to modify arbitrary Dockerfile lines.
+                #
+        
+                escaped_old = re.escape(old_version)
+        
+                matches = re.findall(
+                    escaped_old,
+                    updated_dockerfile
+                )
+        
+                if not matches:
+                    print(
+                        f'WARNING: Version "{old_version}" '
+                        f'not found in Dockerfile for {update["package"]}'
+                    )
+                    continue
+        
+                print(
+                    f'Replacing {old_version} -> {new_version} '
+                    f'for {update["package"]}'
+                )
+        
+                updated_dockerfile = re.sub(
+                    escaped_old,
+                    new_version,
+                    updated_dockerfile
+                )
+        
+            # ------------------------------------------------------------
+            # 11. Safety check
+            #
+            # Make sure Dockerfile structure wasn't changed.
+            # ------------------------------------------------------------
+        
+            original_lines = original_dockerfile.splitlines()
+            updated_lines = updated_dockerfile.splitlines()
+        
+            if len(original_lines) != len(updated_lines):
+                raise Exception(
+                    "SAFETY CHECK FAILED: "
+                    "Number of Dockerfile lines changed!"
+                )
+        
+            # Compare each line after removing version numbers.
+            # This allows version changes but catches structural changes.
+        
+            VERSION_PATTERN = re.compile(
+                r"""
+                (?:
+                    \d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?
+                |
+                    \d+\.\d+(?:[-+][A-Za-z0-9.-]+)?
+                )
+                """,
+                re.VERBOSE
+            )
+        
+            for line_number, (before, after) in enumerate(
+                zip(original_lines, updated_lines),
+                start=1
+            ):
+        
+                normalized_before = VERSION_PATTERN.sub(
+                    "<VERSION>",
+                    before
+                )
+        
+                normalized_after = VERSION_PATTERN.sub(
+                    "<VERSION>",
+                    after
+                )
+        
+                if normalized_before != normalized_after:
+                    raise Exception(
+                        f"SAFETY CHECK FAILED: "
+                        f"Dockerfile line {line_number} changed "
+                        f"beyond version modification.\n"
+                        f"BEFORE: {before}\n"
+                        f"AFTER:  {after}"
+                    )
+        
+            # ------------------------------------------------------------
+            # 12. Write result
+            # ------------------------------------------------------------
+        
+            with open(OUTPUT_PATH, "w") as f:
+                f.write(updated_dockerfile)
+        
+            print("==================================================")
+            print("SUCCESS")
+            print(f"Updated Dockerfile written to: {OUTPUT_PATH}")
+            print("==================================================")
+        
             EOF
             
         - name: Diff, Commit and Push changes
