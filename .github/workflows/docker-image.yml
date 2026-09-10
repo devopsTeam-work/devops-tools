@@ -581,6 +581,25 @@ jobs:
 
               write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
               attempted.append(plan)
+              artifact_preview = plan.get("root_artifact") or {}
+              print(
+                  "Gemini remediation decision:\n"
+                  + json.dumps(
+                      {
+                          "action": plan.get("action"),
+                          "confidence": plan.get("confidence"),
+                          "summary": plan.get("summary"),
+                          "root_artifact": artifact_preview,
+                          "affected_cves": plan.get("affected_cves") or [],
+                          "evidence_count": len(plan.get("evidence") or []),
+                          "model": plan.get("_workflow_model"),
+                          "research_mode": plan.get("_research_mode"),
+                      },
+                      indent=2,
+                      ensure_ascii=False,
+                  ),
+                  flush=True,
+              )
               if plan.get("action") == "no_action":
                   stop_reason = "no_action"
                   break
@@ -603,8 +622,24 @@ jobs:
               try:
                   changed_path, original_text, changed_hash = apply_candidate(plan, allowlist)
               except ValueError as exc:
-                  stop_reason = "no_change_or_rejected_patch"
-                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  error_message = str(exc)
+                  if "unchanged" in error_message or "no change" in error_message:
+                      stop_reason = "no_change"
+                  else:
+                      stop_reason = "rejected_unsafe_or_unmatched_patch"
+                  write_json(
+                      ARTIFACT_DIR / f"error-round-{round_number}.json",
+                      {
+                          "stop_reason": stop_reason,
+                          "error": error_message,
+                          "root_artifact": artifact_preview,
+                      },
+                  )
+                  print(
+                      f"Deterministic patch rejected in round {round_number}: "
+                      f"{error_message}",
+                      flush=True,
+                  )
                   break
 
               try:
