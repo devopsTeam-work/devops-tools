@@ -308,8 +308,13 @@ jobs:
                   raise RuntimeError("GEMINI_API_KEY is not configured")
               client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
               last_error: Exception | None = None
+              attempt_errors: list[dict[str, Any]] = []
               for attempt in range(4):
                   try:
+                      print(
+                          f"Gemini round {round_number}: API attempt {attempt + 1}/4 "
+                          f"using {MODEL}"
+                      )
                       interaction = client.interactions.create(
                           model=MODEL,
                           input=prompt,
@@ -325,11 +330,39 @@ jobs:
                           raw_path.write_text(interaction.model_dump_json(indent=2), encoding="utf-8")
                       except Exception:
                           raw_path.write_text(str(interaction), encoding="utf-8")
-                      return json.loads(interaction.output_text)
+                      output_text = interaction.output_text or ""
+                      if not output_text.strip():
+                          raise RuntimeError("Gemini returned an empty output_text")
+                      try:
+                          return json.loads(output_text)
+                      except json.JSONDecodeError as exc:
+                          (ARTIFACT_DIR / f"gemini-output-round-{round_number}.txt").write_text(
+                              output_text, encoding="utf-8"
+                          )
+                          raise RuntimeError(
+                              f"Gemini returned invalid structured JSON: {exc}"
+                          ) from exc
                   except Exception as exc:
                       last_error = exc
+                      error_record = {
+                          "attempt": attempt + 1,
+                          "type": type(exc).__name__,
+                          "message": str(exc),
+                      }
+                      attempt_errors.append(error_record)
+                      write_json(
+                          ARTIFACT_DIR / f"gemini-errors-round-{round_number}.json",
+                          attempt_errors,
+                      )
+                      print(
+                          f"Gemini round {round_number} attempt {attempt + 1} failed: "
+                          f"{type(exc).__name__}: {exc}",
+                          flush=True,
+                      )
                       if attempt < 3:
-                          time.sleep(15 * (attempt + 1))
+                          wait_seconds = 15 * (attempt + 1)
+                          print(f"Retrying Gemini in {wait_seconds}s...", flush=True)
+                          time.sleep(wait_seconds)
               raise RuntimeError(f"Gemini failed after retries: {last_error}")
 
           def safe_repo_file(value: str, allowlist: set[str]) -> Path:
@@ -423,6 +456,11 @@ jobs:
               except Exception as exc:
                   stop_reason = "gemini_error"
                   write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  print(
+                      f"Stopping remediation: Gemini round {round_number} failed: "
+                      f"{type(exc).__name__}: {exc}",
+                      flush=True,
+                  )
                   break
 
               write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
