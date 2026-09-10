@@ -52,8 +52,7 @@ ARG KUSTOMIZE_VERSION=5.8.1
 ARG JCLI_VERSION=0.0.47
 ARG HELMIFY_VERSION=0.4.20
 ARG JFROG_CLI_VERSION=2.123.0
-ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
-ARG RANCHER_DEFAULT=v2.13.1
+ARG RANCHER_VERSION=2.11.9
 ARG HELM_VERSION=3.21.4
 ARG KUBECTL_VERSION=1.31.0
 ARG YQ_VERSION=4.53.4
@@ -77,15 +76,6 @@ RUN curl ${CURL_OPTS} -o /tmp/jfr.zip "https://github.com/jenkinsci/jenkinsfile-
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} -o /out/bin/jf \
       "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/${JFROG_CLI_VERSION}/jfrog-cli-linux-${ARCH}/jf"
-
-# 5. Rancher CLIs
-#RUN for RV in ${RANCHER_VERSIONS}; do \
-#        curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
-#        mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
-#        rm -rf /tmp/rancher-${RV}; \
-#    done && \
-#    cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
-
 
 
 # 8. Kubernetes tooling
@@ -216,10 +206,10 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
-RUN curl -fsSL https://github.com/rancher/cli/releases/download/v2.11.9/rancher-linux-amd64-v2.11.9.tar.gz \
+RUN curl -fsSL https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz \
     -o /tmp/rancher-cli.tar.gz \
     && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
-    && mv /tmp/rancher-v2.11.9/rancher /usr/local/bin/rancher \
+    && mv /tmp/rancher-v${RANCHER_VERSION}/rancher /usr/local/bin/rancher \
     && chmod +x /usr/local/bin/rancher \
     && rm -rf /tmp/rancher*
 RUN rancher --version
