@@ -206,11 +206,12 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
-RUN curl -fsSL https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz \
-    -o /tmp/rancher-cli.tar.gz \
-    && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
-    && mv /tmp/rancher-v${RANCHER_VERSION}/rancher /usr/local/bin/rancher \
+
+RUN curl -fsSL "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" -o /tmp/rancher-cli.tar.gz \
+    && tar -xzf /tmp/rancher-cli.tar.gz --strip-components=1 -C /usr/local/bin \
     && chmod +x /usr/local/bin/rancher \
-    && rm -rf /tmp/rancher*
+    && rm -f /tmp/rancher-cli.tar.gz
+
+
 RUN rancher --version
 ENTRYPOINT ["jenkinsfile-runner", "-w", "/opt/jenkins", "-f", "/workspace/Jenkinsfile", "-p", "/opt/jenkins/plugins", "--workspace", "/workspace"]
