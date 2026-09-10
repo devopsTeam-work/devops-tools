@@ -12,8 +12,8 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: devops-tools
-  # Ordered fallback chain. A quota error moves immediately to the next model.
-  GEMINI_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite
+  # Free-tier chain. Search and JSON structuring run as two separate calls.
+  GEMINI_MODELS: gemini-2.5-flash-lite,gemini-2.5-flash
   GEMINI_MAX_FINDING_GROUPS: "30"
   GEMINI_MAX_SOURCE_CHARS: "16000"
   MAX_GEMINI_ROUNDS: "2"
@@ -159,7 +159,7 @@ jobs:
               model.strip()
               for model in os.environ.get(
                   "GEMINI_MODELS",
-                  os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                  os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"),
               ).split(",")
               if model.strip()
           ]
@@ -358,7 +358,9 @@ jobs:
                   "For requirements, name is the exact distribution name and values exclude ==. For go_module, name is "
                   "the exact module path. Return no_action if evidence is insufficient, confidence is below 0.90, only "
                   "a transitive artifact could be changed, no stable fix exists, or the prior attempt should not be "
-                  "repeated. Evidence URLs must be pages actually consulted through Google Search.\n\nINPUT:\n"
+                  "repeated. Evidence URLs must be pages actually consulted through Google Search. "
+                  "This is the research phase: return a concise plain-text remediation memo, not JSON. "
+                  "State the exact candidate fields and explain which supplied sources support them.\n\nINPUT:\n"
                   + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
               )
               print(
@@ -373,96 +375,187 @@ jobs:
               if not os.environ.get("GEMINI_API_KEY"):
                   raise RuntimeError("GEMINI_API_KEY is not configured")
               client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-              last_error: Exception | None = None
               attempt_errors: list[dict[str, Any]] = []
               total_attempt = 0
-              for model_index, model in enumerate(MODEL_CANDIDATES):
-                  # Retry transient failures twice per model. A quota failure switches
-                  # models immediately because waiting seconds cannot restore daily quota.
-                  for model_attempt in range(2):
-                      total_attempt += 1
-                      try:
-                          print(
-                              f"Gemini round {round_number}: attempt {total_attempt} using {model}"
-                          )
-                          response = client.models.generate_content(
-                              model=model,
-                              contents=prompt,
-                              config={
-                                  "tools": [{"google_search": {}}],
-                                  # GenerateContentConfig fields supported by
-                                  # google-genai 2.6.x. The response_format
-                                  # shape is not accepted here by this SDK.
-                                  "response_mime_type": "application/json",
-                                  "response_json_schema": schema,
-                              },
-                          )
-                          raw_path = ARTIFACT_DIR / (
-                              f"gemini-response-round-{round_number}-{model}.json"
-                          )
+
+              def record_error(phase: str, model: str, exc: Exception) -> tuple[bool, bool]:
+                  nonlocal total_attempt
+                  is_quota_error = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+                  is_local_config_error = type(exc).__name__ == "ValidationError"
+                  attempt_errors.append({
+                      "attempt": total_attempt,
+                      "phase": phase,
+                      "model": model,
+                      "type": type(exc).__name__,
+                      "message": str(exc),
+                      "quota_error": is_quota_error,
+                      "local_config_error": is_local_config_error,
+                  })
+                  write_json(
+                      ARTIFACT_DIR / f"gemini-errors-round-{round_number}.json",
+                      attempt_errors,
+                  )
+                  print(
+                      f"Gemini round {round_number} {phase} attempt {total_attempt} "
+                      f"with {model} failed: {type(exc).__name__}: {exc}",
+                      flush=True,
+                  )
+                  return is_quota_error, is_local_config_error
+
+              def call_with_fallback(phase: str, request: Any) -> tuple[str, Any]:
+                  nonlocal total_attempt
+                  last_error: Exception | None = None
+                  for model_index, model in enumerate(MODEL_CANDIDATES):
+                      # One retry is reserved for transient server/network failures.
+                      # Quota failures move to the next free-tier model immediately.
+                      for model_attempt in range(2):
+                          total_attempt += 1
                           try:
-                              raw_path.write_text(
-                                  response.model_dump_json(indent=2), encoding="utf-8"
+                              print(
+                                  f"Gemini round {round_number}: {phase} attempt "
+                                  f"{total_attempt} using {model}",
+                                  flush=True,
                               )
-                          except Exception:
-                              raw_path.write_text(str(response), encoding="utf-8")
-                          output_text = response.text or ""
-                          if not output_text.strip():
-                              raise RuntimeError("Gemini returned an empty output_text")
-                          try:
-                              result = json.loads(output_text)
-                          except json.JSONDecodeError as exc:
-                              (ARTIFACT_DIR / f"gemini-output-round-{round_number}.txt").write_text(
-                                  output_text, encoding="utf-8"
+                              return model, request(model)
+                          except Exception as exc:
+                              last_error = exc
+                              is_quota_error, is_local_config_error = record_error(
+                                  phase, model, exc
                               )
-                              raise RuntimeError(
-                                  f"Gemini returned invalid structured JSON: {exc}"
-                              ) from exc
-                          result["_workflow_model"] = model
-                          print(f"Gemini round {round_number}: succeeded with {model}")
-                          return result
-                      except Exception as exc:
-                          last_error = exc
-                          is_quota_error = type(exc).__name__ == "RateLimitError" or "429" in str(exc)
-                          is_local_config_error = type(exc).__name__ == "ValidationError"
-                          error_record = {
-                              "attempt": total_attempt,
-                              "model": model,
-                              "type": type(exc).__name__,
-                              "message": str(exc),
-                              "quota_error": is_quota_error,
-                              "local_config_error": is_local_config_error,
-                          }
-                          attempt_errors.append(error_record)
-                          write_json(
-                              ARTIFACT_DIR / f"gemini-errors-round-{round_number}.json",
-                              attempt_errors,
-                          )
-                          print(
-                              f"Gemini round {round_number} attempt {total_attempt} "
-                              f"with {model} failed: {type(exc).__name__}: {exc}",
-                              flush=True,
-                          )
-                          if is_local_config_error:
-                              raise RuntimeError(
-                                  "Local google-genai configuration validation failed; "
-                                  "the request was not sent to Gemini"
-                              ) from exc
-                          if is_quota_error:
-                              if model_index + 1 < len(MODEL_CANDIDATES):
-                                  print(
-                                      f"Quota unavailable for {model}; switching immediately to "
-                                      f"{MODEL_CANDIDATES[model_index + 1]}",
-                                      flush=True,
-                                  )
-                              break
-                          if model_attempt == 0:
-                              print("Retrying transient Gemini failure in 15s...", flush=True)
-                              time.sleep(15)
-              raise RuntimeError(
-                  f"All configured Gemini models failed ({', '.join(MODEL_CANDIDATES)}): "
-                  f"{last_error}"
+                              if is_local_config_error:
+                                  raise RuntimeError(
+                                      "Local google-genai configuration validation failed; "
+                                      "the request was not sent to Gemini"
+                                  ) from exc
+                              if is_quota_error:
+                                  if model_index + 1 < len(MODEL_CANDIDATES):
+                                      print(
+                                          f"Quota unavailable for {model}; switching to "
+                                          f"{MODEL_CANDIDATES[model_index + 1]}",
+                                          flush=True,
+                                      )
+                                  break
+                              if model_attempt == 0:
+                                  print("Retrying transient Gemini failure in 15s...", flush=True)
+                                  time.sleep(15)
+                  raise RuntimeError(
+                      f"All configured Gemini models failed during {phase} "
+                      f"({', '.join(MODEL_CANDIDATES)}): {last_error}"
+                  )
+
+              def research_request(model: str) -> Any:
+                  return client.models.generate_content(
+                      model=model,
+                      contents=prompt,
+                      config={"tools": [{"google_search": {}}]},
+                  )
+
+              research_model, research_response = call_with_fallback(
+                  "grounded-research", research_request
               )
+              research_raw = ARTIFACT_DIR / (
+                  f"gemini-research-round-{round_number}-{research_model}.json"
+              )
+              try:
+                  research_raw.write_text(
+                      research_response.model_dump_json(indent=2), encoding="utf-8"
+                  )
+              except Exception:
+                  research_raw.write_text(str(research_response), encoding="utf-8")
+
+              research_text = research_response.text or ""
+              if not research_text.strip():
+                  raise RuntimeError("Gemini grounded research returned empty text")
+
+              grounding_sources: list[dict[str, str]] = []
+              try:
+                  metadata = research_response.candidates[0].grounding_metadata
+                  for chunk in metadata.grounding_chunks or []:
+                      web = getattr(chunk, "web", None)
+                      uri = str(getattr(web, "uri", "") or "")
+                      title = str(getattr(web, "title", "") or "")
+                      if uri.startswith("http"):
+                          grounding_sources.append({"title": title, "url": uri})
+              except Exception as exc:
+                  print(f"Could not extract grounding metadata: {exc}", flush=True)
+
+              research_bundle = {
+                  "research_model": research_model,
+                  "memo": research_text,
+                  "grounding_sources": grounding_sources,
+              }
+              write_json(
+                  ARTIFACT_DIR / f"grounded-research-round-{round_number}.json",
+                  research_bundle,
+              )
+
+              structure_prompt = (
+                  "Convert the grounded remediation research below into the required JSON schema. "
+                  "Do not perform web searches and do not add facts, versions, CVEs, or URLs that are "
+                  "absent from the research bundle. Use only grounding_sources for evidence URLs. "
+                  "Return action=no_action with confidence below 0.90 and empty artifact fields if the "
+                  "research does not establish one safe explicit root-artifact upgrade. The candidate "
+                  "must remain limited to base_image, dockerfile_arg, requirements, or go_module.\n\n"
+                  + json.dumps(research_bundle, ensure_ascii=False, separators=(",", ":"))
+              )
+              print(
+                  f"Gemini structured request: {len(structure_prompt)} characters; no Search tool",
+                  flush=True,
+              )
+
+              def structure_request(model: str) -> Any:
+                  return client.models.generate_content(
+                      model=model,
+                      contents=structure_prompt,
+                      config={
+                          "response_mime_type": "application/json",
+                          "response_json_schema": schema,
+                      },
+                  )
+
+              structure_models = [research_model] + [
+                  model for model in MODEL_CANDIDATES if model != research_model
+              ]
+              original_models = MODEL_CANDIDATES[:]
+              MODEL_CANDIDATES[:] = structure_models
+              try:
+                  structure_model, structure_response = call_with_fallback(
+                      "structured-output", structure_request
+                  )
+              finally:
+                  MODEL_CANDIDATES[:] = original_models
+
+              raw_path = ARTIFACT_DIR / (
+                  f"gemini-structured-round-{round_number}-{structure_model}.json"
+              )
+              try:
+                  raw_path.write_text(
+                      structure_response.model_dump_json(indent=2), encoding="utf-8"
+                  )
+              except Exception:
+                  raw_path.write_text(str(structure_response), encoding="utf-8")
+
+              output_text = structure_response.text or ""
+              if not output_text.strip():
+                  raise RuntimeError("Gemini structured-output phase returned empty text")
+              try:
+                  result = json.loads(output_text)
+              except json.JSONDecodeError as exc:
+                  (ARTIFACT_DIR / f"gemini-output-round-{round_number}.txt").write_text(
+                      output_text, encoding="utf-8"
+                  )
+                  raise RuntimeError(
+                      f"Gemini returned invalid structured JSON: {exc}"
+                  ) from exc
+              result["_workflow_model"] = structure_model
+              result["_research_model"] = research_model
+              result["_grounding_source_count"] = len(grounding_sources)
+              print(
+                  f"Gemini round {round_number}: research={research_model}, "
+                  f"structured-output={structure_model}, sources={len(grounding_sources)}",
+                  flush=True,
+              )
+              return result
 
           def safe_repo_file(value: str, allowlist: set[str]) -> Path:
               path = Path(value)
