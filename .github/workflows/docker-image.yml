@@ -141,6 +141,7 @@ jobs:
         if: ${{ !contains(github.ref_name, '_gemini_scan_') }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           python -u - <<'PY'
@@ -202,6 +203,7 @@ jobs:
                               "type": "string",
                               "enum": [
                                   "base_image", "dockerfile_arg", "dockerfile_pip",
+                                  "dockerfile_npm", "dockerfile_go_install",
                                   "requirements", "go_module", "none"
                               ],
                           },
@@ -339,6 +341,9 @@ jobs:
 
           registry_tag_cache: dict[str, list[str]] = {}
           pypi_version_cache: dict[str, list[str]] = {}
+          github_release_cache: dict[str, list[str]] = {}
+          npm_version_cache: dict[str, list[str]] = {}
+          hashicorp_version_cache: dict[str, list[str]] = {}
           allowlist_discovery_errors: list[dict[str, str]] = []
 
           def record_discovery_error(source: str, artifact: str, exc: Exception) -> None:
@@ -456,6 +461,77 @@ jobs:
                       versions.append(version)
               return [str(version) for version in sorted(set(versions))[:MAX_TARGETS_PER_ARTIFACT]]
 
+          def semantic_upgrades(current: str, values: list[str]) -> list[str]:
+              parsed_current = comparable_tag(current)
+              if parsed_current is None:
+                  return []
+              current_version, current_prefix, current_suffix = parsed_current
+              candidates: set[Version] = set()
+              for value in values:
+                  if re.search(r"(?:alpha|beta|rc|preview|nightly)", value, flags=re.IGNORECASE):
+                      continue
+                  match = re.search(r"(?<!\d)(\d+(?:\.\d+){1,3})(?!\d)", value)
+                  if not match:
+                      continue
+                  try:
+                      version = Version(match.group(1))
+                  except InvalidVersion:
+                      continue
+                  if version > current_version and not version.is_prerelease:
+                      candidates.add(version)
+              return [
+                  f"{current_prefix}{version}{current_suffix}"
+                  for version in sorted(candidates)[:MAX_TARGETS_PER_ARTIFACT]
+              ]
+
+          def github_release_versions(owner: str, repository: str, current: str) -> list[str]:
+              key = f"{owner}/{repository}".lower()
+              if key not in github_release_cache:
+                  request = urllib.request.Request(
+                      f"https://api.github.com/repos/{owner}/{repository}/releases?per_page=100",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "User-Agent": "trivy-gemini-remediation",
+                          **(
+                              {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
+                              if os.environ.get("GITHUB_TOKEN") else {}
+                          ),
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS) as response:
+                      payload = json.load(response)
+                  github_release_cache[key] = [
+                      str(item.get("tag_name") or "")
+                      for item in payload
+                      if not item.get("draft") and not item.get("prerelease") and item.get("tag_name")
+                  ]
+              return semantic_upgrades(current, github_release_cache[key])
+
+          def npm_versions(package: str, current: str) -> list[str]:
+              if package not in npm_version_cache:
+                  if not shutil.which("npm"):
+                      raise RuntimeError("npm is unavailable")
+                  result = subprocess.run(
+                      ["npm", "view", package, "versions", "--json"],
+                      check=False,
+                      capture_output=True,
+                      text=True,
+                      timeout=NETWORK_TIMEOUT_SECONDS,
+                  )
+                  if result.returncode != 0:
+                      raise RuntimeError((result.stderr or result.stdout or "npm view failed")[-1000:])
+                  payload = json.loads(result.stdout)
+                  npm_version_cache[package] = payload if isinstance(payload, list) else [str(payload)]
+              return semantic_upgrades(current, npm_version_cache[package])
+
+          def hashicorp_versions(product: str, current: str) -> list[str]:
+              if product not in hashicorp_version_cache:
+                  url = f"https://releases.hashicorp.com/{urllib.parse.quote(product)}/index.json"
+                  with urllib.request.urlopen(url, timeout=NETWORK_TIMEOUT_SECONDS) as response:
+                      payload = json.load(response)
+                  hashicorp_version_cache[product] = list((payload.get("versions") or {}).keys())
+              return semantic_upgrades(current, hashicorp_version_cache[product])
+
           def go_versions(module: str, current: str) -> list[str]:
               if not shutil.which("go"):
                   raise RuntimeError("go is unavailable")
@@ -483,6 +559,22 @@ jobs:
                   if version > current_version and not version.is_prerelease:
                       candidates.append(version)
               return [f"v{version}" for version in sorted(set(candidates))[:MAX_TARGETS_PER_ARTIFACT]]
+
+          def go_install_versions(package_path: str, current: str) -> list[str]:
+              """Walk package parents until the authoritative Go module root is found."""
+              parts = package_path.split("/")
+              last_error: Exception | None = None
+              for length in range(len(parts), 2, -1):
+                  module = "/".join(parts[:length])
+                  try:
+                      values = go_versions(module, current)
+                      if values:
+                          return values
+                  except Exception as exc:
+                      last_error = exc
+              if last_error:
+                  raise last_error
+              return []
 
           def build_upgrade_allowlist() -> list[dict[str, Any]]:
               """Discover upgrade targets from authoritative package/registry indexes."""
@@ -520,6 +612,7 @@ jobs:
                       flags=re.MULTILINE,
                   )
               }
+              logical_docker_text = re.sub(r"\\\s*\n\s*", " ", docker_text)
 
               def expand_args(value: str) -> str:
                   def replace(match: re.Match[str]) -> str:
@@ -584,6 +677,65 @@ jobs:
                           except Exception as exc:
                               record_discovery_error("oci_registry", repository, exc)
 
+              # Resolve version ARGs used by well-known binary release sources.
+              for line in logical_docker_text.splitlines():
+                  variables = [left or right for left, right in re.findall(
+                      r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", line
+                  )]
+                  if not variables:
+                      continue
+                  github_match = re.search(
+                      r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/releases/download/",
+                      line,
+                      flags=re.IGNORECASE,
+                  )
+                  hashicorp_match = re.search(
+                      r"https?://releases\.hashicorp\.com/(?P<product>[A-Za-z0-9_.-]+)/",
+                      line,
+                      flags=re.IGNORECASE,
+                  )
+                  known_github: tuple[str, str] | None = None
+                  if github_match:
+                      known_github = (
+                          github_match.group("owner"),
+                          github_match.group("repo").removesuffix(".git"),
+                      )
+                  elif re.search(r"https?://get\.helm\.sh/", line, flags=re.IGNORECASE):
+                      known_github = ("helm", "helm")
+                  elif re.search(r"https?://dl\.k8s\.io/", line, flags=re.IGNORECASE):
+                      known_github = ("kubernetes", "kubernetes")
+
+                  for variable in variables:
+                      current = arg_defaults.get(variable, "")
+                      if comparable_tag(current) is None:
+                          continue
+                      if known_github:
+                          owner, repository = known_github
+                          try:
+                              add(
+                                  "dockerfile_arg",
+                                  DOCKERFILE.as_posix(),
+                                  variable,
+                                  current,
+                                  github_release_versions(owner, repository, current),
+                                  f"github-releases://{owner}/{repository}",
+                              )
+                          except Exception as exc:
+                              record_discovery_error("github_releases", f"{owner}/{repository}", exc)
+                      elif hashicorp_match:
+                          product = hashicorp_match.group("product")
+                          try:
+                              add(
+                                  "dockerfile_arg",
+                                  DOCKERFILE.as_posix(),
+                                  variable,
+                                  current,
+                                  hashicorp_versions(product, current),
+                                  f"hashicorp-releases://{product}",
+                              )
+                          except Exception as exc:
+                              record_discovery_error("hashicorp_releases", product, exc)
+
               requirement_files = [p for p in Path(".").glob("requirements*.txt") if p.is_file()]
               for path in requirement_files:
                   text = path.read_text(encoding="utf-8")
@@ -598,7 +750,6 @@ jobs:
                       except Exception as exc:
                           record_discovery_error("pypi", name, exc)
 
-              logical_docker_text = re.sub(r"\\\s*\n\s*", " ", docker_text)
               for line in logical_docker_text.splitlines():
                   if "pip install" not in line.lower() or line.lstrip().startswith("#"):
                       continue
@@ -608,6 +759,36 @@ jobs:
                           add("dockerfile_pip", DOCKERFILE.as_posix(), name, current, pypi_versions(name, current), "pypi")
                       except Exception as exc:
                           record_discovery_error("pypi", name, exc)
+
+              for line in logical_docker_text.splitlines():
+                  if re.search(r"\bnpm\s+(?:install|i)\b", line) and not line.lstrip().startswith("#"):
+                      for match in re.finditer(
+                          r"(?<![A-Za-z0-9_.-])(?P<name>@[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[A-Za-z0-9][A-Za-z0-9_.-]*)@(?P<version>\d+(?:\.\d+){1,3})(?![A-Za-z0-9])",
+                          line,
+                      ):
+                          name, current = match.group("name"), match.group("version")
+                          try:
+                              add("dockerfile_npm", DOCKERFILE.as_posix(), name, current, npm_versions(name, current), "npm_registry")
+                          except Exception as exc:
+                              record_discovery_error("npm_registry", name, exc)
+
+                  if re.search(r"\bgo\s+install\b", line) and not line.lstrip().startswith("#"):
+                      for match in re.finditer(
+                          r"(?P<module>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.~+-]+)+)@(?P<version>v\d+(?:\.\d+){1,3})(?![A-Za-z0-9])",
+                          line,
+                      ):
+                          module, current = match.group("module"), match.group("version")
+                          try:
+                              add(
+                                  "dockerfile_go_install",
+                                  DOCKERFILE.as_posix(),
+                                  module,
+                                  current,
+                                  go_install_versions(module, current),
+                                  "go_proxy",
+                              )
+                          except Exception as exc:
+                              record_discovery_error("go_proxy", module, exc)
 
               go_mod = Path("go.mod")
               if go_mod.is_file():
@@ -623,6 +804,116 @@ jobs:
                           record_discovery_error("go_proxy", module, exc)
 
               return artifacts
+
+          def dockerfile_install_warnings(upgrades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              """Inventory unsupported installers without ever failing remediation."""
+              text = DOCKERFILE.read_text(encoding="utf-8")
+              instructions: list[tuple[int, str]] = []
+              buffer = ""
+              start_line = 0
+              for line_number, raw_line in enumerate(text.splitlines(), start=1):
+                  stripped = raw_line.strip()
+                  if not buffer:
+                      start_line = line_number
+                  buffer = f"{buffer} {stripped}".strip()
+                  if re.search(r"\\\s*$", raw_line):
+                      buffer = re.sub(r"\\\s*$", "", buffer).strip()
+                      continue
+                  instructions.append((start_line, buffer))
+                  buffer = ""
+              if buffer:
+                  instructions.append((start_line, buffer))
+
+              recognized_args = {
+                  item["name"]
+                  for item in upgrades
+                  if item["type"] == "dockerfile_arg"
+              }
+              warnings: list[dict[str, Any]] = []
+
+              def add_warning(line: int, code: str, message: str, instruction: str) -> None:
+                  item = {
+                      "status": "warning_only",
+                      "code": code,
+                      "file": DOCKERFILE.as_posix(),
+                      "line": line,
+                      "message": message,
+                      "instruction_sha256": hashlib.sha256(instruction.encode()).hexdigest(),
+                  }
+                  if item not in warnings:
+                      warnings.append(item)
+
+              for line_number, instruction in instructions:
+                  lower = instruction.lower()
+                  if not (lower.startswith("run ") or lower.startswith("add http")):
+                      continue
+
+                  if re.search(r"(?:curl|wget)[^|]*(?:\||&&)\s*(?:sudo\s+)?(?:ba)?sh\b", lower):
+                      add_warning(
+                          line_number,
+                          "remote_script_execution_not_remediated",
+                          "Remote script execution was not mapped or modified; manual review is required.",
+                          instruction,
+                      )
+                      continue
+
+                  if re.search(r"\b(?:apt-get|apt|apk|dnf|yum|microdnf)\s+(?:install|add)\b", lower):
+                      add_warning(
+                          line_number,
+                          "os_packages_delegated_to_base_image",
+                          "OS package changes are intentionally delegated to the verified base-image upgrade.",
+                          instruction,
+                      )
+
+                  if re.search(r"\bpip(?:3)?\s+install\b|\bpython\S*\s+-m\s+pip\s+install\b", lower):
+                      if not re.search(r"[A-Za-z0-9_.-]+==[^\s;'\"\\]+", instruction):
+                          add_warning(
+                              line_number,
+                              "unpinned_pip_install_not_remediated",
+                              "An unpinned pip installation cannot receive a deterministic version allowlist.",
+                              instruction,
+                          )
+
+                  if re.search(r"\bnpm\s+(?:install|i)\b", lower):
+                      if not re.search(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+@\d+(?:\.\d+){1,3}", instruction):
+                          add_warning(
+                              line_number,
+                              "unpinned_npm_install_not_remediated",
+                              "An unpinned npm installation cannot receive a deterministic version allowlist.",
+                              instruction,
+                          )
+
+                  if re.search(r"\bgo\s+install\b", lower):
+                      if not re.search(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.~+-]+)+@v\d+(?:\.\d+){1,3}", instruction):
+                          add_warning(
+                              line_number,
+                              "unpinned_go_install_not_remediated",
+                              "An unpinned Go installation cannot receive a deterministic version allowlist.",
+                              instruction,
+                          )
+
+                  if re.search(r"\b(?:curl|wget)\b|^add\s+https?://", lower):
+                      variables = [left or right for left, right in re.findall(
+                          r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                          instruction,
+                      )]
+                      if not variables or not any(variable in recognized_args for variable in variables):
+                          add_warning(
+                              line_number,
+                              "unsupported_dynamic_source",
+                              "Download source has no trusted dynamic version resolver; it was skipped.",
+                              instruction,
+                          )
+
+                  if re.search(r"\b(?:mvn|gradle|gradlew)\b", lower):
+                      add_warning(
+                          line_number,
+                          "build_tool_dependencies_not_in_dockerfile",
+                          "Build-tool dependencies require their source manifest and were not modified here.",
+                          instruction,
+                      )
+
+              return warnings
 
           def candidate_is_allowlisted(plan: dict[str, Any], upgrades: list[dict[str, Any]]) -> bool:
               artifact = plan.get("root_artifact") or {}
@@ -649,7 +940,9 @@ jobs:
               })
               dynamic_schema["properties"]["root_artifact"]["properties"]["target"] = {
                   "type": "string",
-                  "enum": targets,
+                  # Empty is reserved for action=no_action. Upgrade decisions are
+                  # checked against the exact artifact-specific allowlist below.
+                  "enum": ["", *targets],
               }
               return dynamic_schema
 
@@ -695,7 +988,8 @@ jobs:
                   "searched the web and never invent a version or URL. Determine whether one explicit root artifact "
                   "present in the supplied source files causes multiple or important Trivy findings. Root artifact "
                   "means a base image, an existing Dockerfile ARG, an explicitly pinned top-level requirements.txt "
-                  "dependency, or a direct go.mod module. Never propose adding or directly upgrading a transitive OS "
+                  "dependency, a pinned Dockerfile pip/npm/go-install dependency, or a direct go.mod module. Never "
+                  "propose adding or directly upgrading a transitive OS "
                   "package merely because Trivy names it. Never propose editing compiled binaries, lockfiles, generated "
                   "files, or arbitrary Dockerfile commands. You may select only an artifact identity and exact target "
                   "listed in verified_upgrade_allowlist; those targets were obtained from authoritative registries. "
@@ -704,13 +998,16 @@ jobs:
                   "For base_image, current and target must be complete image references as they appear after FROM "
                   "(excluding AS alias). For dockerfile_arg, name is the ARG variable and current/target are its values. "
                   "For requirements, name is the exact distribution name and values exclude ==. For go_module, name is "
-                  "the exact module path. Return no_action if evidence is insufficient, confidence is below 0.90, only "
+                  "the exact module path. For dockerfile_pip and dockerfile_npm, name is the direct package name. For "
+                  "dockerfile_go_install, name is the exact installed module path. Return no_action if evidence is "
+                  "insufficient, confidence is below 0.90, only "
                   "a transitive artifact could be changed, no stable fix exists, or the prior attempt should not be "
                   "repeated. Evidence URLs must come verbatim from the supplied Trivy advisory URLs. "
                   "Entries in already_attempted can contain an _attempt_result with an exact Docker build or Trivy "
                   "failure. Treat those results as authoritative: never repeat a failed target, and choose a different "
                   "allowlisted evidence-backed target or return no_action. Return no_action when the allowlist has no "
-                  "appropriate target. "
+                  "appropriate target. For no_action, root_artifact.type must be none and file, name, current, and "
+                  "target must all be empty strings. "
                   "Return the remediation decision using the configured JSON schema.\n\nINPUT:\n"
                   + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
               )
@@ -869,6 +1166,18 @@ jobs:
                       raise ValueError("invalid Dockerfile pip candidate")
                   pattern = rf"(?P<prefix>(?<![A-Za-z0-9_.-]){re.escape(name)}==){re.escape(old)}(?P<suffix>(?=[\s;'\"\\]|$))"
                   updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "dockerfile_npm":
+                  if path != DOCKERFILE or not re.fullmatch(
+                      r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9][A-Za-z0-9_.-]*", name
+                  ):
+                      raise ValueError("invalid Dockerfile npm candidate")
+                  pattern = rf"(?P<prefix>(?<![A-Za-z0-9_.-]){re.escape(name)}@){re.escape(old)}(?P<suffix>(?![A-Za-z0-9]))"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "dockerfile_go_install":
+                  if path != DOCKERFILE or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.~+-]+)+", name):
+                      raise ValueError("invalid Dockerfile go-install candidate")
+                  pattern = rf"(?P<prefix>{re.escape(name)}@){re.escape(old)}(?P<suffix>(?![A-Za-z0-9]))"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
               elif kind == "requirements":
                   if not re.fullmatch(r"requirements(?:[-_.][A-Za-z0-9_.-]+)?\.txt", path.name):
                       raise ValueError("requirements candidate is not allowlisted")
@@ -919,7 +1228,18 @@ jobs:
                   break
 
               context, allowlist = source_context()
-              discovered_upgrades = build_upgrade_allowlist()
+              try:
+                  discovered_upgrades = build_upgrade_allowlist()
+              except Exception as exc:
+                  # Discovery is advisory. An unfamiliar Dockerfile construct must
+                  # never fail the original build or security scan.
+                  record_discovery_error("dynamic_mapper", DOCKERFILE.as_posix(), exc)
+                  discovered_upgrades = []
+                  print(
+                      f"::warning file={DOCKERFILE.as_posix()}::Dynamic installer mapping "
+                      f"was skipped after {type(exc).__name__}; remediation will remain no-op safe.",
+                      flush=True,
+                  )
               attempted_targets = {
                   (
                       str((item.get("root_artifact") or {}).get("type", "")),
@@ -939,18 +1259,43 @@ jobs:
                   ]
                   if available:
                       upgrade_allowlist.append({**item, "allowed_targets": available})
+              installer_warnings = dockerfile_install_warnings(upgrade_allowlist)
               write_json(
                   ARTIFACT_DIR / f"verified-allowlist-round-{round_number}.json",
                   {
                       "artifacts": upgrade_allowlist,
                       "discovery_errors": allowlist_discovery_errors,
+                      "unsupported_installers": installer_warnings,
                   },
+              )
+              write_json(
+                  ARTIFACT_DIR / f"unsupported-installers-round-{round_number}.json",
+                  installer_warnings,
               )
               print(
                   f"Verified upgrade allowlist: {len(upgrade_allowlist)} root artifacts, "
                   f"{sum(len(item['allowed_targets']) for item in upgrade_allowlist)} exact targets",
                   flush=True,
               )
+              for item in upgrade_allowlist:
+                  print(
+                      f"  - {item['type']} {item['file']}::{item['name']} "
+                      f"current={item['current']} targets={len(item['allowed_targets'])} "
+                      f"source={item['verified_by']}",
+                      flush=True,
+                  )
+              if allowlist_discovery_errors:
+                  print(
+                      f"Allowlist discovery warnings: {len(allowlist_discovery_errors)} "
+                      "(full details are in the remediation audit artifact)",
+                      flush=True,
+                  )
+              for warning in installer_warnings:
+                  print(
+                      f"::warning file={warning['file']},line={warning['line']}::"
+                      f"{warning['code']}: {warning['message']}",
+                      flush=True,
+                  )
               if not upgrade_allowlist:
                   stop_reason = "no_verified_upgrade_targets"
                   print("Stopping remediation: no registry-verified upgrade targets are available.", flush=True)
@@ -971,6 +1316,16 @@ jobs:
                   )
                   break
 
+              if plan.get("action") == "no_action":
+                  # Canonicalize the non-action payload so an enum required for
+                  # upgrade targets cannot produce a misleading fake candidate.
+                  plan["root_artifact"] = {
+                      "type": "none",
+                      "file": "",
+                      "name": "",
+                      "current": "",
+                      "target": "",
+                  }
               write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
               attempted.append(plan)
               artifact_preview = plan.get("root_artifact") or {}
