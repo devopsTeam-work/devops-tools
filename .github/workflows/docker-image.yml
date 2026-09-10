@@ -49,6 +49,7 @@ jobs:
           if [[ -z "$safe_ref" ]]; then
             safe_ref="ref-${GITHUB_RUN_ID}"
           fi
+          safe_ref="${safe_ref:0:100}"
           echo "DOCKERFILE_PATH=$dockerfile" >> "$GITHUB_ENV"
           echo "IMAGE_NAME=$image" >> "$GITHUB_ENV"
           echo "IMAGE_REF_TAG=$safe_ref" >> "$GITHUB_ENV"
@@ -70,6 +71,16 @@ jobs:
             --tag "$IMAGE_NAME:$IMAGE_REF_TAG" \
             --tag "$IMAGE_NAME:latest" \
             --tag "$BASELINE_IMAGE"
+
+      # The original build is intentionally published before Trivy/Gemini.
+      # Remediation iterations are published under separate immutable tags.
+      - name: Push original Docker image
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '_gemini_scan_') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_NAME:$IMAGE_REF_TAG"
+          docker push "$IMAGE_NAME:latest"
 
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@v0.2.6
@@ -102,19 +113,24 @@ jobs:
             --exit-code 0 \
             "$BASELINE_IMAGE"
 
+      - name: Upload original Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: remediation-artifacts/trivy-baseline.sarif
+
       - name: Setup Python
-        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        if: ${{ !contains(github.ref_name, '_gemini_scan_') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install remediation dependencies
-        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        if: ${{ !contains(github.ref_name, '_gemini_scan_') }}
         run: pip install --disable-pip-version-check "google-genai==2.6.0"
 
       - name: Research, patch, rebuild and validate
         id: remediate
-        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        if: ${{ !contains(github.ref_name, '_gemini_scan_') }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         shell: bash
@@ -387,6 +403,14 @@ jobs:
           attempted: list[dict[str, Any]] = []
           accepted: list[dict[str, Any]] = []
           stop_reason = "maximum_rounds_reached"
+          base_commit = subprocess.run(
+              ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+          ).stdout.strip()
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(
+              ["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"],
+              check=True,
+          )
 
           for round_number in range(1, MAX_ROUNDS + 1):
               if current_metrics["total"] == 0:
@@ -430,7 +454,10 @@ jobs:
                   break
 
               try:
-                  candidate_image = f"{os.environ['IMAGE_NAME']}:remediation-{os.environ['GITHUB_RUN_ID']}-{round_number}"
+                  candidate_image = (
+                      f"{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_REF_TAG']}"
+                      f"_gemini_scan_{round_number}"
+                  )
                   subprocess.run(
                       ["docker", "build", ".", "--file", str(DOCKERFILE), "--tag", candidate_image],
                       check=True,
@@ -465,7 +492,48 @@ jobs:
                   stop_reason = "no_meaningful_improvement"
                   break
 
-              accepted.append({"round": round_number, "plan": plan, "comparison": comparison})
+              # A validated iteration gets its own real commit and external identity.
+              # This makes every accepted Dockerfile state independently reproducible.
+              subprocess.run(["git", "diff", "--check", "--", str(changed_path)], check=True)
+              subprocess.run(["git", "add", "--", str(changed_path)], check=True)
+              subprocess.run(
+                  [
+                      "git", "commit", "-m",
+                      f"chore: validated Gemini remediation round {round_number} ({os.environ['GITHUB_REF_NAME']})",
+                  ],
+                  check=True,
+              )
+              commit_sha = subprocess.run(
+                  ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+              ).stdout.strip()
+              iteration_ref = f"{os.environ['GITHUB_REF_NAME']}_gemini_scan_{round_number}"
+              is_tag_event = os.environ.get("GITHUB_REF", "").startswith("refs/tags/")
+
+              if is_tag_event:
+                  # The parent run publishes every accepted image. The generated tag's
+                  # workflow is guarded from re-running Gemini or re-pushing the image.
+                  subprocess.run(["docker", "push", candidate_image], check=True)
+                  subprocess.run(["git", "tag", iteration_ref, commit_sha], check=True)
+                  subprocess.run(
+                      ["git", "push", "origin", f"refs/tags/{iteration_ref}"], check=True
+                  )
+                  ref_kind = "tag"
+              else:
+                  subprocess.run(
+                      ["git", "push", "origin", f"{commit_sha}:refs/heads/{iteration_ref}"],
+                      check=True,
+                  )
+                  ref_kind = "branch"
+
+              accepted.append({
+                  "round": round_number,
+                  "plan": plan,
+                  "comparison": comparison,
+                  "commit": commit_sha,
+                  "git_ref": iteration_ref,
+                  "git_ref_kind": ref_kind,
+                  "image": candidate_image if is_tag_event else None,
+              })
               current_compact = candidate_compact
               current_metrics = candidate_metrics
               current_image = candidate_image
@@ -480,12 +548,13 @@ jobs:
               "final_metrics": current_metrics,
           }
           write_json(ARTIFACT_DIR / "remediation-summary.json", summary)
-          accepted_files = sorted({item["comparison"]["changed_file"] for item in accepted})
-          (ARTIFACT_DIR / "accepted-files.txt").write_text(
-              "".join(f"{path}\n" for path in accepted_files), encoding="utf-8"
-          )
           (ARTIFACT_DIR / "accepted.diff").write_text(
-              subprocess.run(["git", "diff", "--"], check=False, capture_output=True, text=True).stdout,
+              subprocess.run(
+                  ["git", "diff", "--binary", base_commit, "HEAD"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              ).stdout,
               encoding="utf-8",
           )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -494,72 +563,6 @@ jobs:
           print(json.dumps(summary, indent=2))
           PY
 
-      - name: Rebuild final image with accepted source state
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build . \
-            --file "$DOCKERFILE_PATH" \
-            --tag "$IMAGE_NAME:$IMAGE_REF_TAG" \
-            --tag "$IMAGE_NAME:latest"
-
-      - name: Run final Trivy validation
-        shell: bash
-        run: |
-          set -euo pipefail
-          trivy image \
-            --format json \
-            --output remediation-artifacts/trivy-final.json \
-            --severity "$TRIVY_SEVERITIES" \
-            --ignore-unfixed \
-            --exit-code 0 \
-            "$IMAGE_NAME:$IMAGE_REF_TAG"
-          trivy image \
-            --format sarif \
-            --output trivy-results.sarif \
-            --severity "$TRIVY_SEVERITIES" \
-            --ignore-unfixed \
-            --exit-code 0 \
-            "$IMAGE_NAME:$IMAGE_REF_TAG"
-
-      - name: Upload final Trivy results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-results.sarif
-
-      - name: Push final Docker image
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker push "$IMAGE_NAME:$IMAGE_REF_TAG"
-          docker push "$IMAGE_NAME:latest"
-
-      - name: Commit and push validated remediation
-        if: ${{ !endsWith(github.ref_name, '_gemini_scan') && steps.remediate.outputs.changed == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== Validated remediation diff ==="
-          git diff --check
-          git diff
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          new_ref="${GITHUB_REF_NAME}-${GITHUB_RUN_ID}_gemini_scan"
-          git switch -c "$new_ref"
-          while IFS= read -r changed_file; do
-            [[ -n "$changed_file" ]] && git add -- "$changed_file"
-          done < remediation-artifacts/accepted-files.txt
-
-          if git diff --cached --quiet; then
-            echo "No validated source changes to commit."
-            exit 0
-          fi
-
-          git commit -m "chore: apply validated Gemini security remediation ($GITHUB_REF_NAME)"
-          git push origin "HEAD:refs/heads/$new_ref"
-
       - name: Upload remediation audit artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -567,6 +570,5 @@ jobs:
           name: remediation-audit-${{ github.run_id }}
           path: |
             remediation-artifacts/
-            trivy-results.sarif
           if-no-files-found: warn
           retention-days: 30
