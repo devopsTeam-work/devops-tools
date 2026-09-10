@@ -12,7 +12,7 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: devops-tools
-  GEMINI_MODEL: gemini-3.8-flash
+  GEMINI_MODEL: gemini-3.6-flash
   MAX_GEMINI_ROUNDS: "2"
   MIN_REMEDIATION_CONFIDENCE: "0.90"
   TRIVY_SEVERITIES: CRITICAL,HIGH
