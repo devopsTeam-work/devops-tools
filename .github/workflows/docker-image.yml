@@ -129,7 +129,12 @@ jobs:
 
       - name: Install remediation dependencies
         if: ${{ !contains(github.ref_name, '_gemini_scan_') }}
-        run: pip install --disable-pip-version-check "google-genai==2.6.0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+          pip install --disable-pip-version-check "google-genai==2.6.0" "packaging>=24,<26"
 
       - name: Research, patch, rebuild and validate
         id: remediate
@@ -145,12 +150,16 @@ jobs:
           import json
           import os
           import re
+          import shutil
           import subprocess
           import time
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
           from typing import Any
 
           from google import genai
+          from packaging.version import InvalidVersion, Version
 
           ARTIFACT_DIR = Path("remediation-artifacts")
           ARTIFACT_DIR.mkdir(exist_ok=True)
@@ -169,14 +178,14 @@ jobs:
           MAX_SOURCE_CHARS = int(os.environ.get("GEMINI_MAX_SOURCE_CHARS", "16000"))
           BASELINE_IMAGE = os.environ["BASELINE_IMAGE"]
           SEVERITIES = os.environ.get("TRIVY_SEVERITIES", "CRITICAL,HIGH")
+          MAX_TARGETS_PER_ARTIFACT = 15
+          MAX_ALLOWLIST_ARTIFACTS = 40
+          NETWORK_TIMEOUT_SECONDS = 30
 
           if MAX_ROUNDS != 2:
               raise SystemExit("MAX_GEMINI_ROUNDS must remain exactly 2")
 
           severity_weight = {"CRITICAL": 100, "HIGH": 10, "MEDIUM": 1, "LOW": 0}
-          allowed_manifest_names = {
-              "requirements.txt", "requirements-dev.txt", "requirements-prod.txt", "go.mod"
-          }
 
           schema: dict[str, Any] = {
               "type": "object",
@@ -191,7 +200,10 @@ jobs:
                       "properties": {
                           "type": {
                               "type": "string",
-                              "enum": ["base_image", "dockerfile_arg", "requirements", "go_module", "none"],
+                              "enum": [
+                                  "base_image", "dockerfile_arg", "dockerfile_pip",
+                                  "requirements", "go_module", "none"
+                              ],
                           },
                           "file": {"type": "string"},
                           "name": {"type": "string"},
@@ -325,31 +337,356 @@ jobs:
                   "package_groups": ordered[:MAX_FINDING_GROUPS],
               }
 
+          registry_tag_cache: dict[str, list[str]] = {}
+          pypi_version_cache: dict[str, list[str]] = {}
+          allowlist_discovery_errors: list[dict[str, str]] = []
+
+          def record_discovery_error(source: str, artifact: str, exc: Exception) -> None:
+              item = {
+                  "source": source,
+                  "artifact": artifact,
+                  "error": f"{type(exc).__name__}: {exc}"[-1000:],
+              }
+              if item not in allowlist_discovery_errors:
+                  allowlist_discovery_errors.append(item)
+
+          def comparable_tag(value: str) -> tuple[Version, str, str] | None:
+              match = re.fullmatch(
+                  r"(?P<prefix>v?)(?P<number>\d+(?:\.\d+){1,3})(?P<suffix>(?:[-+._].*)?)",
+                  value,
+              )
+              if not match:
+                  return None
+              try:
+                  return (
+                      Version(match.group("number")),
+                      match.group("prefix"),
+                      match.group("suffix") or "",
+                  )
+              except InvalidVersion:
+                  return None
+
+          def stable_compatible_tags(current: str, tags: list[str]) -> list[str]:
+              parsed_current = comparable_tag(current)
+              if parsed_current is None:
+                  return []
+              current_version, current_prefix, current_suffix = parsed_current
+              candidates: list[tuple[Version, str]] = []
+              for tag in set(tags):
+                  parsed = comparable_tag(tag)
+                  if parsed is None:
+                      continue
+                  version, prefix, suffix = parsed
+                  if prefix != current_prefix or suffix != current_suffix or version <= current_version:
+                      continue
+                  if version.is_prerelease or version.is_devrelease:
+                      continue
+                  candidates.append((version, tag))
+              candidates.sort(key=lambda item: item[0])
+              return [tag for _, tag in candidates[:MAX_TARGETS_PER_ARTIFACT]]
+
+          def normalized_image_repository(repository: str) -> str:
+              parts = repository.split("/")
+              first = parts[0]
+              if "." in first or ":" in first or first == "localhost":
+                  return repository
+              if len(parts) == 1:
+                  return f"docker.io/library/{repository}"
+              return f"docker.io/{repository}"
+
+          def split_tagged_image(image: str) -> tuple[str, str, str] | None:
+              if not image or "$" in image or "@" in image or any(c.isspace() for c in image):
+                  return None
+              slash = image.rfind("/")
+              colon = image.rfind(":")
+              if colon <= slash:
+                  return None
+              display_repository = image[:colon]
+              tag = image[colon + 1:]
+              if not display_repository or not tag:
+                  return None
+              return display_repository, normalized_image_repository(display_repository), tag
+
+          def registry_tags(repository: str) -> list[str]:
+              if repository in registry_tag_cache:
+                  return registry_tag_cache[repository]
+              if not shutil.which("skopeo"):
+                  raise RuntimeError("skopeo is unavailable")
+              command = ["skopeo", "list-tags"]
+              docker_auth = Path.home() / ".docker" / "config.json"
+              if docker_auth.is_file():
+                  command.extend(["--authfile", str(docker_auth)])
+              command.append(f"docker://{repository}")
+              result = subprocess.run(
+                  command,
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  timeout=NETWORK_TIMEOUT_SECONDS,
+              )
+              if result.returncode != 0:
+                  raise RuntimeError((result.stderr or result.stdout or "skopeo failed")[-1000:])
+              payload = json.loads(result.stdout)
+              tags = [str(tag) for tag in payload.get("Tags") or []]
+              registry_tag_cache[repository] = tags
+              return tags
+
+          def pypi_versions(distribution: str, current: str) -> list[str]:
+              cache_key = distribution.lower().replace("_", "-")
+              if cache_key not in pypi_version_cache:
+                  url = f"https://pypi.org/pypi/{urllib.parse.quote(distribution)}/json"
+                  with urllib.request.urlopen(url, timeout=NETWORK_TIMEOUT_SECONDS) as response:
+                      payload = json.load(response)
+                  pypi_version_cache[cache_key] = [
+                      version
+                      for version, files in (payload.get("releases") or {}).items()
+                      if files and any(not bool(item.get("yanked")) for item in files)
+                  ]
+              try:
+                  current_version = Version(current)
+              except InvalidVersion:
+                  return []
+              versions: list[Version] = []
+              for value in pypi_version_cache[cache_key]:
+                  try:
+                      version = Version(value)
+                  except InvalidVersion:
+                      continue
+                  if version > current_version and not version.is_prerelease and not version.is_devrelease:
+                      versions.append(version)
+              return [str(version) for version in sorted(set(versions))[:MAX_TARGETS_PER_ARTIFACT]]
+
+          def go_versions(module: str, current: str) -> list[str]:
+              if not shutil.which("go"):
+                  raise RuntimeError("go is unavailable")
+              result = subprocess.run(
+                  ["go", "list", "-m", "-versions", module],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  timeout=NETWORK_TIMEOUT_SECONDS,
+                  env={**os.environ, "GONOSUMDB": os.environ.get("GONOSUMDB", "")},
+              )
+              if result.returncode != 0:
+                  raise RuntimeError((result.stderr or result.stdout or "go list failed")[-1000:])
+              values = result.stdout.split()[1:]
+              try:
+                  current_version = Version(current.removeprefix("v"))
+              except InvalidVersion:
+                  return []
+              candidates: list[Version] = []
+              for value in values:
+                  try:
+                      version = Version(value.removeprefix("v"))
+                  except InvalidVersion:
+                      continue
+                  if version > current_version and not version.is_prerelease:
+                      candidates.append(version)
+              return [f"v{version}" for version in sorted(set(candidates))[:MAX_TARGETS_PER_ARTIFACT]]
+
+          def build_upgrade_allowlist() -> list[dict[str, Any]]:
+              """Discover upgrade targets from authoritative package/registry indexes."""
+              artifacts: list[dict[str, Any]] = []
+              seen: set[tuple[str, str, str, str]] = set()
+
+              def add(
+                  kind: str,
+                  file: str,
+                  name: str,
+                  current: str,
+                  targets: list[str],
+                  source: str,
+              ) -> None:
+                  key = (kind, file, name, current)
+                  clean_targets = [target for target in dict.fromkeys(targets) if target != current]
+                  if key in seen or not clean_targets or len(artifacts) >= MAX_ALLOWLIST_ARTIFACTS:
+                      return
+                  seen.add(key)
+                  artifacts.append({
+                      "type": kind,
+                      "file": file,
+                      "name": name,
+                      "current": current,
+                      "allowed_targets": clean_targets[:MAX_TARGETS_PER_ARTIFACT],
+                      "verified_by": source,
+                  })
+
+              docker_text = DOCKERFILE.read_text(encoding="utf-8")
+              arg_defaults = {
+                  match.group("name"): match.group("value").strip()
+                  for match in re.finditer(
+                      r"^\s*ARG\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>[^\s#]+)",
+                      docker_text,
+                      flags=re.MULTILINE,
+                  )
+              }
+
+              def expand_args(value: str) -> str:
+                  def replace(match: re.Match[str]) -> str:
+                      name = match.group(1) or match.group(2)
+                      return arg_defaults.get(name, match.group(0))
+                  return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
+
+              from_tokens = [
+                  match.group("image")
+                  for match in re.finditer(
+                      r"^\s*FROM(?:\s+--platform=\S+)?\s+(?P<image>\S+)",
+                      docker_text,
+                      flags=re.MULTILINE | re.IGNORECASE,
+                  )
+              ]
+              for token in from_tokens:
+                  variables = [left or right for left, right in re.findall(
+                      r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", token
+                  )]
+                  if not variables:
+                      parsed = split_tagged_image(token)
+                      if parsed:
+                          display_repository, repository, current = parsed
+                          try:
+                              targets = [
+                                  f"{display_repository}:{tag}"
+                                  for tag in stable_compatible_tags(current, registry_tags(repository))
+                              ]
+                              add("base_image", DOCKERFILE.as_posix(), display_repository, token, targets, f"oci://{repository}")
+                          except Exception as exc:
+                              record_discovery_error("oci_registry", repository, exc)
+                      continue
+
+                  for variable in variables:
+                      current = arg_defaults.get(variable)
+                      if not current:
+                          continue
+                      whole_arg = re.fullmatch(rf"\$\{{?{re.escape(variable)}\}}?", token) is not None
+                      tag_arg = re.search(rf":\$\{{?{re.escape(variable)}\}}?$", token) is not None
+                      if whole_arg:
+                          parsed = split_tagged_image(current)
+                          if not parsed:
+                              continue
+                          display_repository, repository, current_tag = parsed
+                          try:
+                              targets = [
+                                  f"{display_repository}:{tag}"
+                                  for tag in stable_compatible_tags(current_tag, registry_tags(repository))
+                              ]
+                              add("dockerfile_arg", DOCKERFILE.as_posix(), variable, current, targets, f"oci://{repository}")
+                          except Exception as exc:
+                              record_discovery_error("oci_registry", repository, exc)
+                      elif tag_arg:
+                          resolved = expand_args(token)
+                          parsed = split_tagged_image(resolved)
+                          if not parsed:
+                              continue
+                          _, repository, current_tag = parsed
+                          try:
+                              targets = stable_compatible_tags(current_tag, registry_tags(repository))
+                              add("dockerfile_arg", DOCKERFILE.as_posix(), variable, current, targets, f"oci://{repository}")
+                          except Exception as exc:
+                              record_discovery_error("oci_registry", repository, exc)
+
+              requirement_files = [p for p in Path(".").glob("requirements*.txt") if p.is_file()]
+              for path in requirement_files:
+                  text = path.read_text(encoding="utf-8")
+                  for match in re.finditer(
+                      r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*==\s*(?P<version>[^\s;#]+)",
+                      text,
+                      flags=re.MULTILINE,
+                  ):
+                      name, current = match.group("name"), match.group("version")
+                      try:
+                          add("requirements", path.as_posix(), name, current, pypi_versions(name, current), "pypi")
+                      except Exception as exc:
+                          record_discovery_error("pypi", name, exc)
+
+              logical_docker_text = re.sub(r"\\\s*\n\s*", " ", docker_text)
+              for line in logical_docker_text.splitlines():
+                  if "pip install" not in line.lower() or line.lstrip().startswith("#"):
+                      continue
+                  for match in re.finditer(r"(?<![A-Za-z0-9_.-])(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)==(?P<version>[^\s;'\"\\]+)", line):
+                      name, current = match.group("name"), match.group("version")
+                      try:
+                          add("dockerfile_pip", DOCKERFILE.as_posix(), name, current, pypi_versions(name, current), "pypi")
+                      except Exception as exc:
+                          record_discovery_error("pypi", name, exc)
+
+              go_mod = Path("go.mod")
+              if go_mod.is_file():
+                  for match in re.finditer(
+                      r"^\s*(?P<module>[^\s()]+)\s+(?P<version>v\d+[^\s]*)",
+                      go_mod.read_text(encoding="utf-8"),
+                      flags=re.MULTILINE,
+                  ):
+                      module, current = match.group("module"), match.group("version")
+                      try:
+                          add("go_module", "go.mod", module, current, go_versions(module, current), "go_proxy")
+                      except Exception as exc:
+                          record_discovery_error("go_proxy", module, exc)
+
+              return artifacts
+
+          def candidate_is_allowlisted(plan: dict[str, Any], upgrades: list[dict[str, Any]]) -> bool:
+              artifact = plan.get("root_artifact") or {}
+              identity = (
+                  str(artifact.get("type", "")),
+                  str(artifact.get("file", "")),
+                  str(artifact.get("name", "")),
+                  str(artifact.get("current", "")),
+              )
+              target = str(artifact.get("target", ""))
+              return any(
+                  identity == (item["type"], item["file"], item["name"], item["current"])
+                  and target in item["allowed_targets"]
+                  for item in upgrades
+              )
+
+          def response_schema_for(upgrades: list[dict[str, Any]]) -> dict[str, Any]:
+              """Constrain Gemini's target field to registry-verified values at generation time."""
+              dynamic_schema = json.loads(json.dumps(schema))
+              targets = sorted({
+                  target
+                  for item in upgrades
+                  for target in item["allowed_targets"]
+              })
+              dynamic_schema["properties"]["root_artifact"]["properties"]["target"] = {
+                  "type": "string",
+                  "enum": targets,
+              }
+              return dynamic_schema
+
           def source_context() -> tuple[dict[str, str], set[str]]:
               files: list[Path] = [DOCKERFILE]
               files.extend(p for p in Path(".").glob("requirements*.txt") if p.is_file())
               if Path("go.mod").is_file():
                   files.append(Path("go.mod"))
               context: dict[str, str] = {}
-              allowlist: set[str] = set()
+              allowlist: set[str] = {
+                  path.as_posix()
+                  for path in files
+                  if not path.is_symlink() and path.stat().st_size <= 100_000
+              }
               remaining = MAX_SOURCE_CHARS
               for path in files:
                   normalized = path.as_posix()
-                  if path.is_symlink() or path.stat().st_size > 100_000:
+                  if normalized not in allowlist:
                       continue
                   text = path.read_text(encoding="utf-8")
                   excerpt = text[:remaining]
                   context[normalized] = excerpt
-                  allowlist.add(normalized)
                   remaining -= len(excerpt)
                   if remaining <= 0:
                       break
               return context, allowlist
 
-          def prompt_for(compact: dict[str, Any], context: dict[str, str], attempted: list[dict[str, Any]]) -> str:
+          def prompt_for(
+              compact: dict[str, Any],
+              context: dict[str, str],
+              attempted: list[dict[str, Any]],
+              upgrade_allowlist: list[dict[str, Any]],
+          ) -> str:
               payload = {
                   "trivy": research_view(compact),
                   "root_artifact_source_files": context,
+                  "verified_upgrade_allowlist": upgrade_allowlist,
                   "already_attempted": attempted,
               }
               prompt = (
@@ -360,14 +697,20 @@ jobs:
                   "means a base image, an existing Dockerfile ARG, an explicitly pinned top-level requirements.txt "
                   "dependency, or a direct go.mod module. Never propose adding or directly upgrading a transitive OS "
                   "package merely because Trivy names it. Never propose editing compiled binaries, lockfiles, generated "
-                  "files, or arbitrary Dockerfile commands. Select the smallest stable compatible version that fixes "
-                  "the findings and verify that the exact target exists. The current value must exactly match source. "
+                  "files, or arbitrary Dockerfile commands. You may select only an artifact identity and exact target "
+                  "listed in verified_upgrade_allowlist; those targets were obtained from authoritative registries. "
+                  "Never construct, infer, reformat, or invent a target. Select the smallest compatible allowlisted "
+                  "version that addresses the evidence. The current value must exactly match source. "
                   "For base_image, current and target must be complete image references as they appear after FROM "
                   "(excluding AS alias). For dockerfile_arg, name is the ARG variable and current/target are its values. "
                   "For requirements, name is the exact distribution name and values exclude ==. For go_module, name is "
                   "the exact module path. Return no_action if evidence is insufficient, confidence is below 0.90, only "
                   "a transitive artifact could be changed, no stable fix exists, or the prior attempt should not be "
                   "repeated. Evidence URLs must come verbatim from the supplied Trivy advisory URLs. "
+                  "Entries in already_attempted can contain an _attempt_result with an exact Docker build or Trivy "
+                  "failure. Treat those results as authoritative: never repeat a failed target, and choose a different "
+                  "allowlisted evidence-backed target or return no_action. Return no_action when the allowlist has no "
+                  "appropriate target. "
                   "Return the remediation decision using the configured JSON schema.\n\nINPUT:\n"
                   + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
               )
@@ -379,7 +722,11 @@ jobs:
               )
               return prompt
 
-          def call_gemini(prompt: str, round_number: int) -> dict[str, Any]:
+          def call_gemini(
+              prompt: str,
+              round_number: int,
+              response_schema: dict[str, Any],
+          ) -> dict[str, Any]:
               if not os.environ.get("GEMINI_API_KEY"):
                   raise RuntimeError("GEMINI_API_KEY is not configured")
               client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -401,7 +748,7 @@ jobs:
                               contents=prompt,
                               config={
                                   "response_mime_type": "application/json",
-                                  "response_json_schema": schema,
+                                  "response_json_schema": response_schema,
                               },
                           )
                           raw_path = ARTIFACT_DIR / (
@@ -517,8 +864,13 @@ jobs:
                       raise ValueError("invalid Dockerfile ARG candidate")
                   pattern = rf"^(?P<prefix>\s*ARG\s+{re.escape(name)}\s*=\s*){re.escape(old)}(?P<suffix>\s*)$"
                   updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "dockerfile_pip":
+                  if path != DOCKERFILE or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+                      raise ValueError("invalid Dockerfile pip candidate")
+                  pattern = rf"(?P<prefix>(?<![A-Za-z0-9_.-]){re.escape(name)}==){re.escape(old)}(?P<suffix>(?=[\s;'\"\\]|$))"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
               elif kind == "requirements":
-                  if path.name not in allowed_manifest_names or path.suffix != ".txt":
+                  if not re.fullmatch(r"requirements(?:[-_.][A-Za-z0-9_.-]+)?\.txt", path.name):
                       raise ValueError("requirements candidate is not allowlisted")
                   pattern = rf"^(?P<prefix>\s*{re.escape(name)}\s*==\s*){re.escape(old)}(?P<suffix>\s*(?:#.*)?)$"
                   updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
@@ -567,8 +919,48 @@ jobs:
                   break
 
               context, allowlist = source_context()
+              discovered_upgrades = build_upgrade_allowlist()
+              attempted_targets = {
+                  (
+                      str((item.get("root_artifact") or {}).get("type", "")),
+                      str((item.get("root_artifact") or {}).get("file", "")),
+                      str((item.get("root_artifact") or {}).get("name", "")),
+                      str((item.get("root_artifact") or {}).get("current", "")),
+                      str((item.get("root_artifact") or {}).get("target", "")),
+                  )
+                  for item in attempted
+              }
+              upgrade_allowlist: list[dict[str, Any]] = []
+              for item in discovered_upgrades:
+                  identity = (item["type"], item["file"], item["name"], item["current"])
+                  available = [
+                      target for target in item["allowed_targets"]
+                      if (*identity, target) not in attempted_targets
+                  ]
+                  if available:
+                      upgrade_allowlist.append({**item, "allowed_targets": available})
+              write_json(
+                  ARTIFACT_DIR / f"verified-allowlist-round-{round_number}.json",
+                  {
+                      "artifacts": upgrade_allowlist,
+                      "discovery_errors": allowlist_discovery_errors,
+                  },
+              )
+              print(
+                  f"Verified upgrade allowlist: {len(upgrade_allowlist)} root artifacts, "
+                  f"{sum(len(item['allowed_targets']) for item in upgrade_allowlist)} exact targets",
+                  flush=True,
+              )
+              if not upgrade_allowlist:
+                  stop_reason = "no_verified_upgrade_targets"
+                  print("Stopping remediation: no registry-verified upgrade targets are available.", flush=True)
+                  break
               try:
-                  plan = call_gemini(prompt_for(current_compact, context, attempted), round_number)
+                  plan = call_gemini(
+                      prompt_for(current_compact, context, attempted, upgrade_allowlist),
+                      round_number,
+                      response_schema_for(upgrade_allowlist),
+                  )
               except Exception as exc:
                   stop_reason = "gemini_error"
                   write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
@@ -605,6 +997,23 @@ jobs:
                   break
               if float(plan.get("confidence", 0)) < MIN_CONFIDENCE:
                   stop_reason = "confidence_below_threshold"
+                  break
+              if not candidate_is_allowlisted(plan, upgrade_allowlist):
+                  stop_reason = "target_not_in_verified_allowlist"
+                  failure = {
+                      "status": stop_reason,
+                      "error": "Gemini selected an artifact or target outside the verified allowlist",
+                      "failed_root_artifact": artifact_preview,
+                  }
+                  plan["_attempt_result"] = failure
+                  write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
+                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", failure)
+                  print(
+                      f"Gemini round {round_number} target was not allowlisted; no source was changed.",
+                      flush=True,
+                  )
+                  if round_number < MAX_ROUNDS:
+                      continue
                   break
               evidence = plan.get("evidence") or []
               current_cves = {finding["id"] for finding in current_compact["findings"]}
@@ -647,17 +1056,43 @@ jobs:
                       f"{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_REF_TAG']}"
                       f"_gemini_scan_{round_number}"
                   )
-                  subprocess.run(
+                  build_result = subprocess.run(
                       ["docker", "build", ".", "--file", str(DOCKERFILE), "--tag", candidate_image],
-                      check=True,
+                      check=False,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
                   )
+                  build_output = build_result.stdout or ""
+                  print(build_output, end="" if build_output.endswith("\n") else "\n", flush=True)
+                  if build_result.returncode != 0:
+                      raise RuntimeError(
+                          f"Docker build failed with exit code {build_result.returncode}. "
+                          f"Output tail:\n{build_output[-6000:]}"
+                      )
                   scan_path = ARTIFACT_DIR / f"trivy-round-{round_number}.json"
                   scan_image(candidate_image, scan_path)
               except Exception as exc:
                   if changed_path is not None:
                       changed_path.write_text(original_text, encoding="utf-8")
                   stop_reason = "patch_build_or_scan_failed"
-                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  failure = {
+                      "status": stop_reason,
+                      "error": str(exc)[-6000:],
+                      "failed_root_artifact": artifact_preview,
+                      "candidate_image": candidate_image,
+                  }
+                  plan["_attempt_result"] = failure
+                  write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
+                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", failure)
+                  print(
+                      f"Remediation round {round_number} build/scan failed; source restored. "
+                      f"Failure recorded for the next Gemini decision.",
+                      flush=True,
+                  )
+                  if round_number < MAX_ROUNDS:
+                      print(f"Continuing to Gemini round {round_number + 1}.", flush=True)
+                      continue
                   break
 
               candidate_compact = compact_scan(load_scan(scan_path))
