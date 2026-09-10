@@ -390,12 +390,11 @@ jobs:
                               contents=prompt,
                               config={
                                   "tools": [{"google_search": {}}],
-                                  "response_format": {
-                                      "text": {
-                                          "mime_type": "application/json",
-                                          "schema": schema,
-                                      }
-                                  },
+                                  # GenerateContentConfig fields supported by
+                                  # google-genai 2.6.x. The response_format
+                                  # shape is not accepted here by this SDK.
+                                  "response_mime_type": "application/json",
+                                  "response_json_schema": schema,
                               },
                           )
                           raw_path = ARTIFACT_DIR / (
@@ -425,12 +424,14 @@ jobs:
                       except Exception as exc:
                           last_error = exc
                           is_quota_error = type(exc).__name__ == "RateLimitError" or "429" in str(exc)
+                          is_local_config_error = type(exc).__name__ == "ValidationError"
                           error_record = {
                               "attempt": total_attempt,
                               "model": model,
                               "type": type(exc).__name__,
                               "message": str(exc),
                               "quota_error": is_quota_error,
+                              "local_config_error": is_local_config_error,
                           }
                           attempt_errors.append(error_record)
                           write_json(
@@ -442,6 +443,11 @@ jobs:
                               f"with {model} failed: {type(exc).__name__}: {exc}",
                               flush=True,
                           )
+                          if is_local_config_error:
+                              raise RuntimeError(
+                                  "Local google-genai configuration validation failed; "
+                                  "the request was not sent to Gemini"
+                              ) from exc
                           if is_quota_error:
                               if model_index + 1 < len(MODEL_CANDIDATES):
                                   print(
