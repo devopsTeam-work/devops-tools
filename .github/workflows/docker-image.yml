@@ -12,7 +12,8 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: devops-tools
-  GEMINI_MODEL: gemini-3.6-flash
+  # Ordered fallback chain. A quota error moves immediately to the next model.
+  GEMINI_MODELS: gemini-3.6-flash,gemini-3.5-flash-lite
   MAX_GEMINI_ROUNDS: "2"
   MIN_REMEDIATION_CONFIDENCE: "0.90"
   TRIVY_SEVERITIES: CRITICAL,HIGH
@@ -152,7 +153,14 @@ jobs:
           ARTIFACT_DIR = Path("remediation-artifacts")
           ARTIFACT_DIR.mkdir(exist_ok=True)
           DOCKERFILE = Path(os.environ["DOCKERFILE_PATH"])
-          MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+          MODEL_CANDIDATES = [
+              model.strip()
+              for model in os.environ.get(
+                  "GEMINI_MODELS",
+                  os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+              ).split(",")
+              if model.strip()
+          ]
           MAX_ROUNDS = int(os.environ.get("MAX_GEMINI_ROUNDS", "2"))
           MIN_CONFIDENCE = float(os.environ.get("MIN_REMEDIATION_CONFIDENCE", "0.90"))
           BASELINE_IMAGE = os.environ["BASELINE_IMAGE"]
@@ -309,61 +317,85 @@ jobs:
               client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
               last_error: Exception | None = None
               attempt_errors: list[dict[str, Any]] = []
-              for attempt in range(4):
-                  try:
-                      print(
-                          f"Gemini round {round_number}: API attempt {attempt + 1}/4 "
-                          f"using {MODEL}"
-                      )
-                      interaction = client.interactions.create(
-                          model=MODEL,
-                          input=prompt,
-                          tools=[{"type": "google_search"}],
-                          response_format={
-                              "type": "text",
-                              "mime_type": "application/json",
-                              "schema": schema,
-                          },
-                      )
-                      raw_path = ARTIFACT_DIR / f"gemini-interaction-round-{round_number}.json"
+              total_attempt = 0
+              for model_index, model in enumerate(MODEL_CANDIDATES):
+                  # Retry transient failures twice per model. A quota failure switches
+                  # models immediately because waiting seconds cannot restore daily quota.
+                  for model_attempt in range(2):
+                      total_attempt += 1
                       try:
-                          raw_path.write_text(interaction.model_dump_json(indent=2), encoding="utf-8")
-                      except Exception:
-                          raw_path.write_text(str(interaction), encoding="utf-8")
-                      output_text = interaction.output_text or ""
-                      if not output_text.strip():
-                          raise RuntimeError("Gemini returned an empty output_text")
-                      try:
-                          return json.loads(output_text)
-                      except json.JSONDecodeError as exc:
-                          (ARTIFACT_DIR / f"gemini-output-round-{round_number}.txt").write_text(
-                              output_text, encoding="utf-8"
+                          print(
+                              f"Gemini round {round_number}: attempt {total_attempt} using {model}"
                           )
-                          raise RuntimeError(
-                              f"Gemini returned invalid structured JSON: {exc}"
-                          ) from exc
-                  except Exception as exc:
-                      last_error = exc
-                      error_record = {
-                          "attempt": attempt + 1,
-                          "type": type(exc).__name__,
-                          "message": str(exc),
-                      }
-                      attempt_errors.append(error_record)
-                      write_json(
-                          ARTIFACT_DIR / f"gemini-errors-round-{round_number}.json",
-                          attempt_errors,
-                      )
-                      print(
-                          f"Gemini round {round_number} attempt {attempt + 1} failed: "
-                          f"{type(exc).__name__}: {exc}",
-                          flush=True,
-                      )
-                      if attempt < 3:
-                          wait_seconds = 15 * (attempt + 1)
-                          print(f"Retrying Gemini in {wait_seconds}s...", flush=True)
-                          time.sleep(wait_seconds)
-              raise RuntimeError(f"Gemini failed after retries: {last_error}")
+                          interaction = client.interactions.create(
+                              model=model,
+                              input=prompt,
+                              tools=[{"type": "google_search"}],
+                              response_format={
+                                  "type": "text",
+                                  "mime_type": "application/json",
+                                  "schema": schema,
+                              },
+                          )
+                          raw_path = ARTIFACT_DIR / (
+                              f"gemini-interaction-round-{round_number}-{model}.json"
+                          )
+                          try:
+                              raw_path.write_text(
+                                  interaction.model_dump_json(indent=2), encoding="utf-8"
+                              )
+                          except Exception:
+                              raw_path.write_text(str(interaction), encoding="utf-8")
+                          output_text = interaction.output_text or ""
+                          if not output_text.strip():
+                              raise RuntimeError("Gemini returned an empty output_text")
+                          try:
+                              result = json.loads(output_text)
+                          except json.JSONDecodeError as exc:
+                              (ARTIFACT_DIR / f"gemini-output-round-{round_number}.txt").write_text(
+                                  output_text, encoding="utf-8"
+                              )
+                              raise RuntimeError(
+                                  f"Gemini returned invalid structured JSON: {exc}"
+                              ) from exc
+                          result["_workflow_model"] = model
+                          print(f"Gemini round {round_number}: succeeded with {model}")
+                          return result
+                      except Exception as exc:
+                          last_error = exc
+                          is_quota_error = type(exc).__name__ == "RateLimitError" or "429" in str(exc)
+                          error_record = {
+                              "attempt": total_attempt,
+                              "model": model,
+                              "type": type(exc).__name__,
+                              "message": str(exc),
+                              "quota_error": is_quota_error,
+                          }
+                          attempt_errors.append(error_record)
+                          write_json(
+                              ARTIFACT_DIR / f"gemini-errors-round-{round_number}.json",
+                              attempt_errors,
+                          )
+                          print(
+                              f"Gemini round {round_number} attempt {total_attempt} "
+                              f"with {model} failed: {type(exc).__name__}: {exc}",
+                              flush=True,
+                          )
+                          if is_quota_error:
+                              if model_index + 1 < len(MODEL_CANDIDATES):
+                                  print(
+                                      f"Quota unavailable for {model}; switching immediately to "
+                                      f"{MODEL_CANDIDATES[model_index + 1]}",
+                                      flush=True,
+                                  )
+                              break
+                          if model_attempt == 0:
+                              print("Retrying transient Gemini failure in 15s...", flush=True)
+                              time.sleep(15)
+              raise RuntimeError(
+                  f"All configured Gemini models failed ({', '.join(MODEL_CANDIDATES)}): "
+                  f"{last_error}"
+              )
 
           def safe_repo_file(value: str, allowlist: set[str]) -> Path:
               path = Path(value)
