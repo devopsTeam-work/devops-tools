@@ -207,11 +207,15 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
 
-RUN curl -fsSL "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" -o /tmp/rancher-cli.tar.gz \
-    && tar -xzf /tmp/rancher-cli.tar.gz --strip-components=1 -C /usr/local/bin \
-    && chmod +x /usr/local/bin/rancher \
+RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
+    && curl -fsSL \
+      "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" \
+      -o /tmp/rancher-cli.tar.gz \
+    && tar -xzf /tmp/rancher-cli.tar.gz \
+      --strip-components=1 \
+      -C /usr/local/bin \
+    && chmod 0755 /usr/local/bin/rancher \
     && rm -f /tmp/rancher-cli.tar.gz
-
 
 RUN rancher --version
 ENTRYPOINT ["jenkinsfile-runner", "-w", "/opt/jenkins", "-f", "/workspace/Jenkinsfile", "-p", "/opt/jenkins/plugins", "--workspace", "/workspace"]
