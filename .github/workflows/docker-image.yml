@@ -307,6 +307,7 @@ jobs:
                           "finding_count": 0,
                           "cves": [],
                           "advisories": [],
+                          "package_paths": [],
                       },
                   )
                   group["finding_count"] += 1
@@ -323,6 +324,13 @@ jobs:
                       and len(group["advisories"]) < 5
                   ):
                       group["advisories"].append(advisory)
+                  package_path = finding.get("package_path", "")
+                  if (
+                      package_path
+                      and package_path not in group["package_paths"]
+                      and len(group["package_paths"]) < 5
+                  ):
+                      group["package_paths"].append(package_path)
 
               ordered = sorted(
                   groups.values(),
@@ -579,7 +587,7 @@ jobs:
           def build_upgrade_allowlist() -> list[dict[str, Any]]:
               """Discover upgrade targets from authoritative package/registry indexes."""
               artifacts: list[dict[str, Any]] = []
-              seen: set[tuple[str, str, str, str]] = set()
+              artifact_index: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
               def add(
                   kind: str,
@@ -591,17 +599,32 @@ jobs:
               ) -> None:
                   key = (kind, file, name, current)
                   clean_targets = [target for target in dict.fromkeys(targets) if target != current]
-                  if key in seen or not clean_targets or len(artifacts) >= MAX_ALLOWLIST_ARTIFACTS:
+                  if not clean_targets:
                       return
-                  seen.add(key)
-                  artifacts.append({
+                  if key in artifact_index:
+                      # One ARG can feed multiple downloads. A target is safe only
+                      # when every authoritative source using that ARG contains it.
+                      existing = artifact_index[key]
+                      existing["allowed_targets"] = [
+                          target for target in existing["allowed_targets"]
+                          if target in clean_targets
+                      ]
+                      sources = existing["verified_by"].split(" & ")
+                      if source not in sources:
+                          existing["verified_by"] += f" & {source}"
+                      return
+                  if len(artifacts) >= MAX_ALLOWLIST_ARTIFACTS:
+                      return
+                  item = {
                       "type": kind,
                       "file": file,
                       "name": name,
                       "current": current,
                       "allowed_targets": clean_targets[:MAX_TARGETS_PER_ARTIFACT],
                       "verified_by": source,
-                  })
+                  }
+                  artifact_index[key] = item
+                  artifacts.append(item)
 
               docker_text = DOCKERFILE.read_text(encoding="utf-8")
               arg_defaults = {
@@ -679,62 +702,66 @@ jobs:
 
               # Resolve version ARGs used by well-known binary release sources.
               for line in logical_docker_text.splitlines():
-                  variables = [left or right for left, right in re.findall(
-                      r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", line
-                  )]
-                  if not variables:
-                      continue
-                  github_match = re.search(
-                      r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/releases/download/",
-                      line,
-                      flags=re.IGNORECASE,
-                  )
-                  hashicorp_match = re.search(
-                      r"https?://releases\.hashicorp\.com/(?P<product>[A-Za-z0-9_.-]+)/",
-                      line,
-                      flags=re.IGNORECASE,
-                  )
-                  known_github: tuple[str, str] | None = None
-                  if github_match:
-                      known_github = (
-                          github_match.group("owner"),
-                          github_match.group("repo").removesuffix(".git"),
-                      )
-                  elif re.search(r"https?://get\.helm\.sh/", line, flags=re.IGNORECASE):
-                      known_github = ("helm", "helm")
-                  elif re.search(r"https?://dl\.k8s\.io/", line, flags=re.IGNORECASE):
-                      known_github = ("kubernetes", "kubernetes")
-
-                  for variable in variables:
-                      current = arg_defaults.get(variable, "")
-                      if comparable_tag(current) is None:
+                  # Associate an ARG only with the exact URL token containing it.
+                  # A single RUN commonly downloads many unrelated tools.
+                  for url in re.findall(r"https?://[^\s'\"]+", line, flags=re.IGNORECASE):
+                      variables = [left or right for left, right in re.findall(
+                          r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                          url,
+                      )]
+                      if not variables:
                           continue
-                      if known_github:
-                          owner, repository = known_github
-                          try:
-                              add(
-                                  "dockerfile_arg",
-                                  DOCKERFILE.as_posix(),
-                                  variable,
-                                  current,
-                                  github_release_versions(owner, repository, current),
-                                  f"github-releases://{owner}/{repository}",
-                              )
-                          except Exception as exc:
-                              record_discovery_error("github_releases", f"{owner}/{repository}", exc)
-                      elif hashicorp_match:
-                          product = hashicorp_match.group("product")
-                          try:
-                              add(
-                                  "dockerfile_arg",
-                                  DOCKERFILE.as_posix(),
-                                  variable,
-                                  current,
-                                  hashicorp_versions(product, current),
-                                  f"hashicorp-releases://{product}",
-                              )
-                          except Exception as exc:
-                              record_discovery_error("hashicorp_releases", product, exc)
+                      github_match = re.search(
+                          r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/releases/download/",
+                          url,
+                          flags=re.IGNORECASE,
+                      )
+                      hashicorp_match = re.search(
+                          r"releases\.hashicorp\.com/(?P<product>[A-Za-z0-9_.-]+)/",
+                          url,
+                          flags=re.IGNORECASE,
+                      )
+                      known_github: tuple[str, str] | None = None
+                      if github_match:
+                          known_github = (
+                              github_match.group("owner"),
+                              github_match.group("repo").removesuffix(".git"),
+                          )
+                      elif re.search(r"get\.helm\.sh/", url, flags=re.IGNORECASE):
+                          known_github = ("helm", "helm")
+                      elif re.search(r"dl\.k8s\.io/", url, flags=re.IGNORECASE):
+                          known_github = ("kubernetes", "kubernetes")
+
+                      for variable in variables:
+                          current = arg_defaults.get(variable, "")
+                          if comparable_tag(current) is None:
+                              continue
+                          if known_github:
+                              owner, repository = known_github
+                              try:
+                                  add(
+                                      "dockerfile_arg",
+                                      DOCKERFILE.as_posix(),
+                                      variable,
+                                      current,
+                                      github_release_versions(owner, repository, current),
+                                      f"github-releases://{owner}/{repository}",
+                                  )
+                              except Exception as exc:
+                                  record_discovery_error("github_releases", f"{owner}/{repository}", exc)
+                          elif hashicorp_match:
+                              product = hashicorp_match.group("product")
+                              try:
+                                  add(
+                                      "dockerfile_arg",
+                                      DOCKERFILE.as_posix(),
+                                      variable,
+                                      current,
+                                      hashicorp_versions(product, current),
+                                      f"hashicorp-releases://{product}",
+                                  )
+                              except Exception as exc:
+                                  record_discovery_error("hashicorp_releases", product, exc)
 
               requirement_files = [p for p in Path(".").glob("requirements*.txt") if p.is_file()]
               for path in requirement_files:
@@ -893,17 +920,19 @@ jobs:
                           )
 
                   if re.search(r"\b(?:curl|wget)\b|^add\s+https?://", lower):
-                      variables = [left or right for left, right in re.findall(
-                          r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
-                          instruction,
-                      )]
-                      if not variables or not any(variable in recognized_args for variable in variables):
-                          add_warning(
-                              line_number,
-                              "unsupported_dynamic_source",
-                              "Download source has no trusted dynamic version resolver; it was skipped.",
-                              instruction,
-                          )
+                      urls = re.findall(r"https?://[^\s'\"]+", instruction, flags=re.IGNORECASE)
+                      for url in urls or [instruction]:
+                          variables = [left or right for left, right in re.findall(
+                              r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                              url,
+                          )]
+                          if not variables or not any(variable in recognized_args for variable in variables):
+                              add_warning(
+                                  line_number,
+                                  "unsupported_dynamic_source",
+                                  "Download source has no trusted dynamic version resolver; it was skipped.",
+                                  instruction,
+                              )
 
                   if re.search(r"\b(?:mvn|gradle|gradlew)\b", lower):
                       add_warning(
@@ -945,6 +974,59 @@ jobs:
                   "enum": ["", *targets],
               }
               return dynamic_schema
+
+          def enrich_allowlist_with_trivy(
+              upgrades: list[dict[str, Any]], compact: dict[str, Any]
+          ) -> list[dict[str, Any]]:
+              """Attach bounded path/name ownership hints without authorizing new targets."""
+              groups = research_view(compact)["package_groups"]
+              generic_aliases = {
+                  "arg", "default", "image", "tag", "version", "cli", "cmd", "tool", "release"
+              }
+              enriched: list[dict[str, Any]] = []
+              for original in upgrades:
+                  item = dict(original)
+                  aliases: set[str] = set()
+                  name = str(item.get("name", "")).lower()
+                  for token in re.split(r"[^a-z0-9]+", name):
+                      if len(token) >= 2 and token not in generic_aliases:
+                          aliases.add(token)
+                  source = str(item.get("verified_by", "")).lower()
+                  for source_item in source.split(" & "):
+                      tail = source_item.rstrip("/").rsplit("/", 1)[-1].split(":", 1)[0]
+                      if len(tail) >= 2 and tail not in generic_aliases and "." not in tail:
+                          aliases.add(tail)
+                  if "dind" in aliases:
+                      aliases.update({"docker", "dockerd"})
+                  if "sealed" in aliases or "secrets" in aliases:
+                      aliases.add("kubeseal")
+
+                  related: list[dict[str, Any]] = []
+                  for group in groups:
+                      haystack = " ".join([
+                          str(group.get("package", "")),
+                          str(group.get("target", "")),
+                          *[str(path) for path in group.get("package_paths") or []],
+                      ]).lower()
+                      normalized_haystack = re.sub(r"[^a-z0-9]+", " ", haystack)
+                      if not any(
+                          re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", normalized_haystack)
+                          for alias in aliases
+                      ):
+                          continue
+                      related.append({
+                          "package": group.get("package"),
+                          "target": group.get("target"),
+                          "package_paths": group.get("package_paths") or [],
+                          "highest_severity": group.get("highest_severity"),
+                          "cves": (group.get("cves") or [])[:8],
+                      })
+                      if len(related) >= 5:
+                          break
+                  item["artifact_aliases"] = sorted(aliases)
+                  item["related_trivy_findings"] = related
+                  enriched.append(item)
+              return enriched
 
           def source_context() -> tuple[dict[str, str], set[str]]:
               files: list[Path] = [DOCKERFILE]
@@ -994,7 +1076,14 @@ jobs:
                   "files, or arbitrary Dockerfile commands. You may select only an artifact identity and exact target "
                   "listed in verified_upgrade_allowlist; those targets were obtained from authoritative registries. "
                   "Never construct, infer, reformat, or invent a target. Select the smallest compatible allowlisted "
-                  "version that addresses the evidence. The current value must exactly match source. "
+                  "version that addresses the evidence. related_trivy_findings are deterministic name/path ownership "
+                  "hints connecting an artifact to scanned binaries. When those hints show an exact binary ownership "
+                  "match and a newer verified release exists, you may return upgrade as an empirical validation "
+                  "candidate even when release notes do not prove the CVE fix; the mandatory rebuild and Trivy rescan "
+                  "will be the source of truth and will revert a non-improving change. Confidence in that case measures "
+                  "the root-artifact attribution and mutation safety, not a guarantee of remediation. Prefer the latest "
+                  "stable patch/minor target within the current major when compiler metadata is unavailable. The "
+                  "current value must exactly match source. "
                   "For base_image, current and target must be complete image references as they appear after FROM "
                   "(excluding AS alias). For dockerfile_arg, name is the ARG variable and current/target are its values. "
                   "For requirements, name is the exact distribution name and values exclude ==. For go_module, name is "
@@ -1259,6 +1348,9 @@ jobs:
                   ]
                   if available:
                       upgrade_allowlist.append({**item, "allowed_targets": available})
+              upgrade_allowlist = enrich_allowlist_with_trivy(
+                  upgrade_allowlist, current_compact
+              )
               installer_warnings = dockerfile_install_warnings(upgrade_allowlist)
               write_json(
                   ARTIFACT_DIR / f"verified-allowlist-round-{round_number}.json",
