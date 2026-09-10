@@ -385,26 +385,29 @@ jobs:
                           print(
                               f"Gemini round {round_number}: attempt {total_attempt} using {model}"
                           )
-                          interaction = client.interactions.create(
+                          response = client.models.generate_content(
                               model=model,
-                              input=prompt,
-                              tools=[{"type": "google_search"}],
-                              response_format={
-                                  "type": "text",
-                                  "mime_type": "application/json",
-                                  "schema": schema,
+                              contents=prompt,
+                              config={
+                                  "tools": [{"google_search": {}}],
+                                  "response_format": {
+                                      "text": {
+                                          "mime_type": "application/json",
+                                          "schema": schema,
+                                      }
+                                  },
                               },
                           )
                           raw_path = ARTIFACT_DIR / (
-                              f"gemini-interaction-round-{round_number}-{model}.json"
+                              f"gemini-response-round-{round_number}-{model}.json"
                           )
                           try:
                               raw_path.write_text(
-                                  interaction.model_dump_json(indent=2), encoding="utf-8"
+                                  response.model_dump_json(indent=2), encoding="utf-8"
                               )
                           except Exception:
-                              raw_path.write_text(str(interaction), encoding="utf-8")
-                          output_text = interaction.output_text or ""
+                              raw_path.write_text(str(response), encoding="utf-8")
+                          output_text = response.text or ""
                           if not output_text.strip():
                               raise RuntimeError("Gemini returned an empty output_text")
                           try:
