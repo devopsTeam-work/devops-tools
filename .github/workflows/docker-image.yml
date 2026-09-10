@@ -352,6 +352,7 @@ jobs:
           github_release_cache: dict[str, list[str]] = {}
           npm_version_cache: dict[str, list[str]] = {}
           hashicorp_version_cache: dict[str, list[str]] = {}
+          recognized_dynamic_sources: dict[str, str] = {}
           allowlist_discovery_errors: list[dict[str, str]] = []
 
           def record_discovery_error(source: str, artifact: str, exc: Exception) -> None:
@@ -739,26 +740,32 @@ jobs:
                           if known_github:
                               owner, repository = known_github
                               try:
+                                  verified_source = f"github-releases://{owner}/{repository}"
+                                  targets = github_release_versions(owner, repository, current)
+                                  recognized_dynamic_sources[variable] = verified_source
                                   add(
                                       "dockerfile_arg",
                                       DOCKERFILE.as_posix(),
                                       variable,
                                       current,
-                                      github_release_versions(owner, repository, current),
-                                      f"github-releases://{owner}/{repository}",
+                                      targets,
+                                      verified_source,
                                   )
                               except Exception as exc:
                                   record_discovery_error("github_releases", f"{owner}/{repository}", exc)
                           elif hashicorp_match:
                               product = hashicorp_match.group("product")
                               try:
+                                  verified_source = f"hashicorp-releases://{product}"
+                                  targets = hashicorp_versions(product, current)
+                                  recognized_dynamic_sources[variable] = verified_source
                                   add(
                                       "dockerfile_arg",
                                       DOCKERFILE.as_posix(),
                                       variable,
                                       current,
-                                      hashicorp_versions(product, current),
-                                      f"hashicorp-releases://{product}",
+                                      targets,
+                                      verified_source,
                                   )
                               except Exception as exc:
                                   record_discovery_error("hashicorp_releases", product, exc)
@@ -855,7 +862,7 @@ jobs:
                   item["name"]
                   for item in upgrades
                   if item["type"] == "dockerfile_arg"
-              }
+              } | set(recognized_dynamic_sources)
               warnings: list[dict[str, Any]] = []
 
               def add_warning(line: int, code: str, message: str, instruction: str) -> None:
@@ -1294,6 +1301,42 @@ jobs:
                   check=True,
               )
 
+          def iteration_identity(round_number: int) -> tuple[str, bool, str]:
+              """Keep the short name on first use and avoid collisions on reruns."""
+              is_tag_event = os.environ.get("GITHUB_REF", "").startswith("refs/tags/")
+              base_ref = f"{os.environ['GITHUB_REF_NAME']}_gemini_scan_{round_number}"
+              namespace = "tags" if is_tag_event else "heads"
+              lookup = subprocess.run(
+                  ["git", "ls-remote", "--exit-code", "origin", f"refs/{namespace}/{base_ref}"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if lookup.returncode not in (0, 2):
+                  raise RuntimeError(
+                      f"Unable to check remote remediation ref: "
+                      f"{(lookup.stderr or lookup.stdout)[-1000:]}"
+                  )
+              collision = lookup.returncode == 0
+              unique_suffix = (
+                  f"_{os.environ.get('GITHUB_RUN_ID', 'run')}"
+                  f"_{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+              )
+              iteration_ref = f"{base_ref}{unique_suffix}" if collision else base_ref
+
+              image_base = f"{os.environ['IMAGE_REF_TAG']}_gemini_scan_{round_number}"
+              if collision:
+                  image_tag = f"{image_base[:128 - len(unique_suffix)]}{unique_suffix}"
+              else:
+                  image_tag = image_base[:128]
+              candidate_image = f"{os.environ['IMAGE_NAME']}:{image_tag}"
+              if collision:
+                  print(
+                      f"Remediation ref {base_ref} already exists; using {iteration_ref}.",
+                      flush=True,
+                  )
+              return iteration_ref, is_tag_event, candidate_image
+
           baseline_path = ARTIFACT_DIR / "trivy-round-0.json"
           current_compact = compact_scan(load_scan(baseline_path))
           write_json(ARTIFACT_DIR / "compact-round-0.json", current_compact)
@@ -1352,12 +1395,22 @@ jobs:
                   upgrade_allowlist, current_compact
               )
               installer_warnings = dockerfile_install_warnings(upgrade_allowlist)
+              upgradable_arg_names = {
+                  item["name"] for item in upgrade_allowlist
+                  if item["type"] == "dockerfile_arg"
+              }
+              recognized_without_upgrade = {
+                  name: source
+                  for name, source in recognized_dynamic_sources.items()
+                  if name not in upgradable_arg_names
+              }
               write_json(
                   ARTIFACT_DIR / f"verified-allowlist-round-{round_number}.json",
                   {
                       "artifacts": upgrade_allowlist,
                       "discovery_errors": allowlist_discovery_errors,
                       "unsupported_installers": installer_warnings,
+                      "recognized_sources_without_upgrade": recognized_without_upgrade,
                   },
               )
               write_json(
@@ -1380,6 +1433,12 @@ jobs:
                   print(
                       f"Allowlist discovery warnings: {len(allowlist_discovery_errors)} "
                       "(full details are in the remediation audit artifact)",
+                      flush=True,
+                  )
+              if recognized_without_upgrade:
+                  print(
+                      "Recognized dynamic sources with no newer compatible target: "
+                      + ", ".join(sorted(recognized_without_upgrade)),
                       flush=True,
                   )
               for warning in installer_warnings:
@@ -1498,11 +1557,9 @@ jobs:
                   )
                   break
 
+              candidate_image = ""
               try:
-                  candidate_image = (
-                      f"{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_REF_TAG']}"
-                      f"_gemini_scan_{round_number}"
-                  )
+                  iteration_ref, is_tag_event, candidate_image = iteration_identity(round_number)
                   build_result = subprocess.run(
                       ["docker", "build", ".", "--file", str(DOCKERFILE), "--tag", candidate_image],
                       check=False,
@@ -1577,9 +1634,6 @@ jobs:
               commit_sha = subprocess.run(
                   ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
               ).stdout.strip()
-              iteration_ref = f"{os.environ['GITHUB_REF_NAME']}_gemini_scan_{round_number}"
-              is_tag_event = os.environ.get("GITHUB_REF", "").startswith("refs/tags/")
-
               if is_tag_event:
                   # The parent run publishes every accepted image. The generated tag's
                   # workflow is guarded from re-running Gemini or re-pushing the image.
