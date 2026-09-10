@@ -13,7 +13,9 @@ permissions:
 env:
   IMAGE_REPOSITORY: devops-tools
   # Ordered fallback chain. A quota error moves immediately to the next model.
-  GEMINI_MODELS: gemini-3.6-flash,gemini-3.5-flash-lite
+  GEMINI_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite
+  GEMINI_MAX_FINDING_GROUPS: "30"
+  GEMINI_MAX_SOURCE_CHARS: "16000"
   MAX_GEMINI_ROUNDS: "2"
   MIN_REMEDIATION_CONFIDENCE: "0.90"
   TRIVY_SEVERITIES: CRITICAL,HIGH
@@ -163,6 +165,8 @@ jobs:
           ]
           MAX_ROUNDS = int(os.environ.get("MAX_GEMINI_ROUNDS", "2"))
           MIN_CONFIDENCE = float(os.environ.get("MIN_REMEDIATION_CONFIDENCE", "0.90"))
+          MAX_FINDING_GROUPS = int(os.environ.get("GEMINI_MAX_FINDING_GROUPS", "30"))
+          MAX_SOURCE_CHARS = int(os.environ.get("GEMINI_MAX_SOURCE_CHARS", "16000"))
           BASELINE_IMAGE = os.environ["BASELINE_IMAGE"]
           SEVERITIES = os.environ.get("TRIVY_SEVERITIES", "CRITICAL,HIGH")
 
@@ -266,6 +270,53 @@ jobs:
           def metrics(compact: dict[str, Any]) -> dict[str, int]:
               return dict(compact["metrics"])
 
+          def research_view(compact: dict[str, Any]) -> dict[str, Any]:
+              """Aggregate CVEs by vulnerable package/version before sending to Gemini."""
+              groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+              for finding in compact["findings"]:
+                  key = (
+                      finding["package"],
+                      finding["installed"],
+                      finding["fixed"],
+                      finding["target"],
+                      finding["target_type"],
+                  )
+                  group = groups.setdefault(
+                      key,
+                      {
+                          "package": finding["package"],
+                          "installed": finding["installed"],
+                          "fixed": finding["fixed"],
+                          "target": finding["target"],
+                          "target_type": finding["target_type"],
+                          "highest_severity": finding["severity"],
+                          "finding_count": 0,
+                          "cves": [],
+                      },
+                  )
+                  group["finding_count"] += 1
+                  if severity_weight.get(finding["severity"], 0) > severity_weight.get(
+                      group["highest_severity"], 0
+                  ):
+                      group["highest_severity"] = finding["severity"]
+                  if len(group["cves"]) < 12:
+                      group["cves"].append(finding["id"])
+
+              ordered = sorted(
+                  groups.values(),
+                  key=lambda item: (
+                      -severity_weight.get(item["highest_severity"], 0),
+                      -item["finding_count"],
+                      item["package"],
+                  ),
+              )
+              return {
+                  "full_scan_metrics": compact["metrics"],
+                  "total_package_groups": len(ordered),
+                  "groups_truncated": len(ordered) > MAX_FINDING_GROUPS,
+                  "package_groups": ordered[:MAX_FINDING_GROUPS],
+              }
+
           def source_context() -> tuple[dict[str, str], set[str]]:
               files: list[Path] = [DOCKERFILE]
               files.extend(p for p in Path(".").glob("requirements*.txt") if p.is_file())
@@ -273,7 +324,7 @@ jobs:
                   files.append(Path("go.mod"))
               context: dict[str, str] = {}
               allowlist: set[str] = set()
-              remaining = 60_000
+              remaining = MAX_SOURCE_CHARS
               for path in files:
                   normalized = path.as_posix()
                   if path.is_symlink() or path.stat().st_size > 100_000:
@@ -289,11 +340,11 @@ jobs:
 
           def prompt_for(compact: dict[str, Any], context: dict[str, str], attempted: list[dict[str, Any]]) -> str:
               payload = {
-                  "trivy": compact,
+                  "trivy": research_view(compact),
                   "root_artifact_source_files": context,
                   "already_attempted": attempted,
               }
-              return (
+              prompt = (
                   "Act as a container security remediation researcher. Use Google Search to verify current, "
                   "authoritative release or advisory information. Determine whether one explicit root artifact "
                   "present in the supplied source files causes multiple or important Trivy findings. Root artifact "
@@ -310,6 +361,13 @@ jobs:
                   "repeated. Evidence URLs must be pages actually consulted through Google Search.\n\nINPUT:\n"
                   + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
               )
+              print(
+                  f"Gemini compact request: {len(prompt)} characters, "
+                  f"up to {MAX_FINDING_GROUPS} package groups and "
+                  f"{MAX_SOURCE_CHARS} source characters",
+                  flush=True,
+              )
+              return prompt
 
           def call_gemini(prompt: str, round_number: int) -> dict[str, Any]:
               if not os.environ.get("GEMINI_API_KEY"):
