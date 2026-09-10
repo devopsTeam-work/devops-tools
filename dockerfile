@@ -52,7 +52,6 @@ ARG KUSTOMIZE_VERSION=5.8.1
 ARG JCLI_VERSION=0.0.47
 ARG HELMIFY_VERSION=0.4.20
 ARG JFROG_CLI_VERSION=2.123.0
-ARG RANCHER_VERSION=2.11.9
 ARG HELM_VERSION=3.21.4
 ARG KUBECTL_VERSION=1.31.0
 ARG YQ_VERSION=4.53.4
@@ -206,6 +205,7 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
+ARG RANCHER_VERSION=2.11.9
 
 RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
     && curl -fsSL \
