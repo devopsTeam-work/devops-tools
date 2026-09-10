@@ -2,653 +2,571 @@ name: Docker Image CI
 
 on:
   push:
-    branches: [ "**" ] # ירוץ על כל push בכל בראנץ'
+    branches: ["**"]
     tags:
-      - '*'
+      - "*"
+
 permissions:
-  contents: write # שונה ל-write כדי לאפשר לדחוף ברנצ'ים וטאגים חדשים
+  contents: write
   security-events: write
-  
+
+env:
+  IMAGE_REPOSITORY: devops-tools
+  GEMINI_MODEL: gemini-3.8-flash
+  MAX_GEMINI_ROUNDS: "2"
+  MIN_REMEDIATION_CONFIDENCE: "0.90"
+  TRIVY_SEVERITIES: CRITICAL,HIGH
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-        - name: show tag name
-          run: echo "$GITHUB_REF_NAME"
+      - name: Show tag or branch name
+        run: echo "$GITHUB_REF_NAME"
 
-        - name: Checkout code
-          uses: actions/checkout@v4
-          with:
-            fetch-depth: 0 # חשוב כדי שנוכל לייצר ברנצ'ים ולדחוף אותם
-            token: ${{ secrets.GH_PAT }} # שימוש ב-PAT מורשה שמפעיל Triggers
-            
-        - name: Set dynamic tag
-          run: echo "TAG_DATE=$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
-    
-        # התחברות ישירה ל-Docker Hub באמצעות ה-Secrets שלך
-        - name: Login to Docker Hub
-          run: echo "${{ secrets.DEVOPS_TEAM_PASSWORD }}" | docker login -u "${{ secrets.DEVOPS_TEAM_USERNAME }}" --password-stdin
-    
-        # בניית האימג' עם השם המלא של ה-Repository שלך ב-Docker Hub
-        - name: Build the Docker image
-          run: |
-            docker build . \
-              --file Dockerfile \
-              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:$GITHUB_REF_NAME \
-              --tag ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest
-    
-        # דחיפה (Push) של האימג' ל-Docker Hub
-        - name: Push Docker image
-          if: startsWith(github.ref, 'refs/tags/')
-          run: |
-            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:$GITHUB_REF_NAME
-            docker push ${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest
-            
-        - name: Run Trivy Scanner (SARIF Output)
-          uses: aquasecurity/trivy-action@master
-          with:
-            image-ref: "${{ secrets.DEVOPS_TEAM_USERNAME }}/devops-tools:latest"
-            format: 'sarif'
-            output: 'trivy-results.sarif'
-            severity: 'CRITICAL,HIGH'
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
 
-        - name: Upload Trivy Results to GitHub Security Tab
-          uses: github/codeql-action/upload-sarif@v4
-          with:
-            sarif_file: 'trivy-results.sarif'
+      - name: Resolve Dockerfile and image names
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f Dockerfile ]]; then
+            dockerfile="Dockerfile"
+          elif [[ -f dockerfile ]]; then
+            dockerfile="dockerfile"
+          else
+            echo "::error::Neither Dockerfile nor dockerfile exists"
+            exit 1
+          fi
 
-        # ==========================================
-        # שלבי התיקון האוטומטי באמצעות Gemini API
-        # ==========================================
+          image="${{ secrets.DEVOPS_TEAM_USERNAME }}/${IMAGE_REPOSITORY}"
+          safe_ref="$(printf '%s' "$GITHUB_REF_NAME" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')"
+          if [[ -z "$safe_ref" ]]; then
+            safe_ref="ref-${GITHUB_RUN_ID}"
+          fi
+          echo "DOCKERFILE_PATH=$dockerfile" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=$image" >> "$GITHUB_ENV"
+          echo "IMAGE_REF_TAG=$safe_ref" >> "$GITHUB_ENV"
+          echo "BASELINE_IMAGE=$image:remediation-${GITHUB_RUN_ID}-0" >> "$GITHUB_ENV"
+          echo "TAG_DATE=$(date +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
 
-        - name: Setup Python
-          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.10'
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DEVOPS_TEAM_USERNAME }}
+          password: ${{ secrets.DEVOPS_TEAM_PASSWORD }}
 
-        - name: Analyze vulnerabilities with Gemini
-          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
-          env:
-            GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          run: |
-            pip install -q google-genai
-        
-            python -u - << 'EOF'
-            import os
-            import json
-            import time
-            import re
-            from google import genai
-            from google.genai.errors import APIError
-        
-            MODEL = "gemini-3.5-flash-lite"
-        
-            client = genai.Client(
-                api_key=os.environ["GEMINI_API_KEY"]
-            )
-        
-            # ------------------------------------------------------------
-            # Read Dockerfile
-            # ------------------------------------------------------------
-        
-            with open("dockerfile", "r") as f:
-                dockerfile = f.read()
-        
-            # ------------------------------------------------------------
-            # Parse SARIF
-            # ------------------------------------------------------------
-        
-            findings = []
-        
-            with open("trivy-results.sarif", "r") as f:
-                sarif = json.load(f)
-        
-            for run in sarif.get("runs", []):
-        
-                rules = {}
-        
-                for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
-                    rule_id = rule.get("id")
-        
-                    properties = rule.get("properties", {}) or {}
-        
-                    rules[rule_id] = {
-                        "severity": (
-                            properties.get("severity")
-                            or properties.get("security-severity")
-                            or ""
-                        )
-                    }
-        
-                for result in run.get("results", []):
-        
-                    rule_id = result.get("ruleId", "UNKNOWN")
-        
-                    message = (
-                        result.get("message", {})
-                        .get("text", "")
-                    )
-        
-                    severity = rules.get(
-                        rule_id,
-                        {}
-                    ).get("severity", "")
-        
-                    findings.append({
-                        "cve": rule_id,
-                        "severity": severity,
-                        "message": message
-                    })
-        
-            # ------------------------------------------------------------
-            # Extract useful information from Trivy messages
-            # ------------------------------------------------------------
-        
-            compact = []
-        
-            for finding in findings:
-        
-                message = finding["message"]
-        
-                installed = None
-                fixed = None
-                package = None
-        
-                m = re.search(
-                    r"Package:\s*([^\s]+)",
-                    message,
-                    re.IGNORECASE
-                )
-        
-                if m:
-                    package = m.group(1)
-        
-                m = re.search(
-                    r"Installed Version:\s*([^\s]+)",
-                    message,
-                    re.IGNORECASE
-                )
-        
-                if m:
-                    installed = m.group(1)
-        
-                m = re.search(
-                    r"Fixed Version:\s*([^\s]+)",
-                    message,
-                    re.IGNORECASE
-                )
-        
-                if m:
-                    fixed = m.group(1)
-        
-                compact.append({
-                    "cve": finding["cve"],
-                    "severity": finding["severity"],
-                    "package": package,
-                    "installed_version": installed,
-                    "fixed_version": fixed
-                })
-        
-            # ------------------------------------------------------------
-            # Deduplicate
-            # ------------------------------------------------------------
-        
-            unique = {}
-        
-            for item in compact:
-        
-                key = (
-                    item["cve"],
-                    item["package"],
-                    item["installed_version"],
-                    item["fixed_version"]
-                )
-        
-                unique[key] = item
-        
-            compact = list(unique.values())
-        
-            print("==================================================")
-            print(f"Trivy findings: {len(findings)}")
-            print(f"Unique findings: {len(compact)}")
-            print("==================================================")
-        
-            # ------------------------------------------------------------
-            # Gemini
-            # ------------------------------------------------------------
-        
-            prompt = f"""
-            You are a Senior DevOps and Cyber Security Engineer.
-            
-            Analyze the Trivy findings below and determine how each vulnerability
-            could be remediated.
-            
-            IMPORTANT:
-            
-            The vulnerable package may come from:
-            
-            1. Dockerfile
-            2. go.mod / Go dependency
-            3. base image
-            4. compiled binary
-            5. another dependency source
-            
-            DO NOT assume that every vulnerability can be fixed by changing
-            the Dockerfile.
-            
-            For every package, determine the most likely source.
-            
-            Allowed source values:
-            
-            - "dockerfile"
-            - "go.mod"
-            - "base_image"
-            - "binary"
-            - "unknown"
-            
-            Rules:
-            
-            1. Only recommend real, stable versions.
-            2. Never invent versions.
-            3. Prefer the smallest stable version that fixes the vulnerabilities.
-            4. Preserve compatibility.
-            5. If the vulnerability is inside a compiled binary and cannot safely
-               be changed directly from the Dockerfile, mark source as "binary".
-            6. If there is not enough information to determine the source,
-               mark source as "unknown".
-            7. Do not return a Dockerfile.
-            8. Do not return markdown.
-            9. Return ONLY valid JSON.
-            
-            Return exactly:
-            
-            {{
-              "updates": [
-                {{
-                  "package": "package-name",
-                  "installed_version": "current",
-                  "target_version": "target",
-                  "source": "dockerfile|go.mod|base_image|binary|unknown",
-                  "confidence": "high|medium|low",
-                  "reason": "short explanation"
-                }}
-              ]
-            }}
-            
-            Trivy findings:
-            
-            {json.dumps(compact, indent=2)}
-            """
-        
-            print("==================================================")
-            print("Sending vulnerability metadata to Gemini")
-            print("==================================================")
-        
-            # ------------------------------------------------------------
-            # Token count
-            # ------------------------------------------------------------
-        
-            try:
-                token_count = client.models.count_tokens(
-                    model=MODEL,
-                    contents=prompt
-                )
-        
-                print(
-                    f"Gemini input tokens: "
-                    f"{token_count.total_tokens}"
-                )
-        
-            except Exception as e:
-                print(
-                    f"Could not calculate token count: {e}"
-                )
-        
-            # ------------------------------------------------------------
-            # Call Gemini
-            # ------------------------------------------------------------
-        
-            result = None
-        
-            for attempt in range(4):
-        
-                try:
-        
-                    response = client.models.generate_content(
-                        model=MODEL,
-                        contents=prompt,
-                        config={
-                            "response_mime_type": "application/json",
-                            "temperature": 0
-                        }
-                    )
-        
-                    result = json.loads(
-                        response.text
-                    )
-        
-                    break
-        
-                except APIError as e:
-        
-                    wait = (attempt + 1) * 40
-        
-                    print(
-                        f"Gemini API error: {e}"
-                    )
-        
-                    print(
-                        f"Retrying in {wait}s..."
-                    )
-        
-                    time.sleep(wait)
-        
-                except Exception as e:
-        
-                    print(
-                        f"Gemini error: {e}"
-                    )
-        
-                    if attempt == 3:
-                        raise
-        
-                    time.sleep(15)
-        
-            if not result:
-                raise Exception(
-                    "Gemini did not return a valid response"
-                )
-        
-            updates = result.get("updates", [])
-        
-            print("==================================================")
-            print("Gemini recommendations")
-            print("==================================================")
-        
-            for update in updates:
-        
-                print(
-                    f'{update.get("package")}: '
-                    f'{update.get("installed_version")} -> '
-                    f'{update.get("target_version")} '
-                    f'[{update.get("source")}]'
-                )
-        
-            # ------------------------------------------------------------
-            # Save Gemini result
-            # ------------------------------------------------------------
-        
-            with open(
-                "gemini-updates.json",
-                "w"
-            ) as f:
-        
-                json.dump(
-                    result,
-                    f,
-                    indent=2
-                )
-        
-            print("==================================================")
-            print(
-                f"Gemini suggested {len(updates)} updates"
-            )
-            print(
-                "Saved to gemini-updates.json"
-            )
-            print("==================================================")
-        
-            EOF
-            
-        - name: Apply Gemini Dockerfile updates
-          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
-          run: |
-            python -u - << 'EOF'
-            import json
-            import re
-        
-            DOCKERFILE = "dockerfile"
-            NEW_DOCKERFILE = "dockerfile.new"
-        
-            with open(DOCKERFILE, "r") as f:
-                original = f.read()
-        
-            with open("gemini-updates.json", "r") as f:
-                data = json.load(f)
-        
-            updates = data.get("updates", [])
-        
-            print("==================================================")
-            print("Applying Gemini recommendations")
-            print("==================================================")
-        
-            print(
-                f"Total Gemini recommendations: "
-                f"{len(updates)}"
-            )
-        
-            dockerfile_updates = [
-                u for u in updates
-                if u.get("source") == "dockerfile"
-            ]
-        
-            print(
-                f"Dockerfile updates: "
-                f"{len(dockerfile_updates)}"
-            )
-        
-            updated = original
-        
-            applied = []
-            skipped = []
-        
-            for update in dockerfile_updates:
-        
-                package = update.get("package")
-                old = update.get("installed_version")
-                new = update.get("target_version")
-        
-                if not old or not new:
-        
-                    skipped.append({
-                        "package": package,
-                        "reason": "Missing version"
-                    })
-        
-                    continue
-        
-                # Exact version match
-                pattern = re.escape(old)
-        
-                matches = list(
-                    re.finditer(
-                        pattern,
-                        updated
-                    )
-                )
-        
-                if not matches:
-        
-                    print(
-                        f'WARNING: Version "{old}" not found '
-                        f'in Dockerfile for {package}'
-                    )
-        
-                    skipped.append({
-                        "package": package,
-                        "old": old,
-                        "new": new,
-                        "reason": "Version not found in Dockerfile"
-                    })
-        
-                    continue
-        
-                if len(matches) > 1:
-        
-                    print(
-                        f'WARNING: Version "{old}" appears '
-                        f'{len(matches)} times for {package}'
-                    )
-        
-                    skipped.append({
-                        "package": package,
-                        "old": old,
-                        "new": new,
-                        "reason": "Version appears multiple times"
-                    })
-        
-                    continue
-        
-                updated = re.sub(
-                    pattern,
-                    new,
-                    updated,
-                    count=1
-                )
-        
-                applied.append({
-                    "package": package,
-                    "old": old,
-                    "new": new
-                })
-        
-                print(
-                    f"✓ {package}: "
-                    f"{old} -> {new}"
-                )
-        
-            # ------------------------------------------------------------
-            # Save result
-            # ------------------------------------------------------------
-        
-            with open(
-                NEW_DOCKERFILE,
-                "w"
-            ) as f:
-        
-                f.write(updated)
-        
-            # ------------------------------------------------------------
-            # Summary
-            # ------------------------------------------------------------
-        
-            print("")
-            print("==================================================")
-            print("UPDATE SUMMARY")
-            print("==================================================")
-        
-            print(
-                f"Gemini recommendations : {len(updates)}"
-            )
-        
-            print(
-                f"Dockerfile candidates  : "
-                f"{len(dockerfile_updates)}"
-            )
-        
-            print(
-                f"Applied                 : "
-                f"{len(applied)}"
-            )
-        
-            print(
-                f"Skipped                 : "
-                f"{len(skipped)}"
-            )
-        
-            print("==================================================")
-        
-            if skipped:
-        
-                print("")
-                print("Skipped updates:")
-        
-                for item in skipped:
-                    print(
-                        f'- {item["package"]}: '
-                        f'{item["reason"]}'
-                    )
-        
-            EOF
-            
-        - name: Commit and push Gemini Dockerfile changes
-          if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
-          run: |
-            echo "=== Diff between Original and Gemini's Suggestion ==="
-        
-            diff -u dockerfile dockerfile.new || true
-        
-            # ------------------------------------------------------------
-            # Check if Dockerfile actually changed
-            # ------------------------------------------------------------
-        
-            if cmp -s dockerfile dockerfile.new; then
-        
-              echo "=================================================="
-              echo "No applicable Dockerfile changes."
-              echo "=================================================="
-        
-              if [[ -f gemini-updates.json ]]; then
-                echo "Gemini recommendations existed,"
-                echo "but none resulted in Dockerfile changes."
-              fi
-        
-              exit 0
-            fi
-        
-            # ------------------------------------------------------------
-            # Replace Dockerfile
-            # ------------------------------------------------------------
-        
-            mv dockerfile.new dockerfile
-        
-            # ------------------------------------------------------------
-            # Git config
-            # ------------------------------------------------------------
-        
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-            NEW_REF="${GITHUB_REF_NAME}_gemini_scan"
-        
-            # ------------------------------------------------------------
-            # Push
-            # ------------------------------------------------------------
-        
-            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-        
-              echo "Triggered by Tag."
-              echo "Creating branch: $NEW_REF"
-        
-              git checkout -b "$NEW_REF"
-        
-              git add dockerfile
-        
-              git commit \
-                -m "chore: secure dockerfile versions via Gemini (Tag: $GITHUB_REF_NAME)"
-        
-              git push origin "$NEW_REF"
-        
-              echo "Creating tag: $NEW_REF"
-        
-              git tag "$NEW_REF"
-        
-              git push origin "$NEW_REF"
-        
-            else
-        
-              echo "Triggered by Branch."
-              echo "Creating branch: $NEW_REF"
-        
-              git checkout -b "$NEW_REF"
-        
-              git add dockerfile
-        
-              git commit \
-                -m "chore: secure dockerfile versions via Gemini (Branch: $GITHUB_REF_NAME)"
-        
-              git push origin "$NEW_REF"
-        
-            fi
+      - name: Build the Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build . \
+            --file "$DOCKERFILE_PATH" \
+            --tag "$IMAGE_NAME:$IMAGE_REF_TAG" \
+            --tag "$IMAGE_NAME:latest" \
+            --tag "$BASELINE_IMAGE"
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: v0.69.3
+          cache: true
+
+      - name: Run baseline Trivy scan (JSON)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p remediation-artifacts
+          trivy image \
+            --format json \
+            --output remediation-artifacts/trivy-round-0.json \
+            --severity "$TRIVY_SEVERITIES" \
+            --ignore-unfixed \
+            --exit-code 0 \
+            "$BASELINE_IMAGE"
+
+      - name: Run Trivy scan for GitHub Security (SARIF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy image \
+            --format sarif \
+            --output remediation-artifacts/trivy-baseline.sarif \
+            --severity "$TRIVY_SEVERITIES" \
+            --ignore-unfixed \
+            --exit-code 0 \
+            "$BASELINE_IMAGE"
+
+      - name: Setup Python
+        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install remediation dependencies
+        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        run: pip install --disable-pip-version-check "google-genai==2.6.0"
+
+      - name: Research, patch, rebuild and validate
+        id: remediate
+        if: ${{ !endsWith(github.ref_name, '_gemini_scan') }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        shell: bash
+        run: |
+          python -u - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          from google import genai
+
+          ARTIFACT_DIR = Path("remediation-artifacts")
+          ARTIFACT_DIR.mkdir(exist_ok=True)
+          DOCKERFILE = Path(os.environ["DOCKERFILE_PATH"])
+          MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+          MAX_ROUNDS = int(os.environ.get("MAX_GEMINI_ROUNDS", "2"))
+          MIN_CONFIDENCE = float(os.environ.get("MIN_REMEDIATION_CONFIDENCE", "0.90"))
+          BASELINE_IMAGE = os.environ["BASELINE_IMAGE"]
+          SEVERITIES = os.environ.get("TRIVY_SEVERITIES", "CRITICAL,HIGH")
+
+          if MAX_ROUNDS != 2:
+              raise SystemExit("MAX_GEMINI_ROUNDS must remain exactly 2")
+
+          severity_weight = {"CRITICAL": 100, "HIGH": 10, "MEDIUM": 1, "LOW": 0}
+          allowed_manifest_names = {
+              "requirements.txt", "requirements-dev.txt", "requirements-prod.txt", "go.mod"
+          }
+
+          schema: dict[str, Any] = {
+              "type": "object",
+              "additionalProperties": False,
+              "properties": {
+                  "action": {"type": "string", "enum": ["upgrade", "no_action"]},
+                  "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                  "summary": {"type": "string"},
+                  "root_artifact": {
+                      "type": "object",
+                      "additionalProperties": False,
+                      "properties": {
+                          "type": {
+                              "type": "string",
+                              "enum": ["base_image", "dockerfile_arg", "requirements", "go_module", "none"],
+                          },
+                          "file": {"type": "string"},
+                          "name": {"type": "string"},
+                          "current": {"type": "string"},
+                          "target": {"type": "string"},
+                      },
+                      "required": ["type", "file", "name", "current", "target"],
+                  },
+                  "affected_cves": {"type": "array", "items": {"type": "string"}},
+                  "evidence": {
+                      "type": "array",
+                      "items": {
+                          "type": "object",
+                          "additionalProperties": False,
+                          "properties": {
+                              "title": {"type": "string"},
+                              "url": {"type": "string"},
+                              "reason": {"type": "string"},
+                          },
+                          "required": ["title", "url", "reason"],
+                      },
+                  },
+              },
+              "required": ["action", "confidence", "summary", "root_artifact", "affected_cves", "evidence"],
+          }
+
+          def write_json(path: Path, value: Any) -> None:
+              path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          def load_scan(path: Path) -> dict[str, Any]:
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def compact_scan(scan: dict[str, Any]) -> dict[str, Any]:
+              unique: dict[tuple[str, str, str, str, str], dict[str, str]] = {}
+              for result in scan.get("Results") or []:
+                  target = str(result.get("Target") or "")
+                  target_class = str(result.get("Class") or "")
+                  target_type = str(result.get("Type") or "")
+                  for vuln in result.get("Vulnerabilities") or []:
+                      severity = str(vuln.get("Severity") or "UNKNOWN").upper()
+                      item = {
+                          "id": str(vuln.get("VulnerabilityID") or "UNKNOWN"),
+                          "severity": severity,
+                          "package": str(vuln.get("PkgName") or ""),
+                          "installed": str(vuln.get("InstalledVersion") or ""),
+                          "fixed": str(vuln.get("FixedVersion") or ""),
+                          "package_path": str(vuln.get("PkgPath") or ""),
+                          "target": target,
+                          "target_class": target_class,
+                          "target_type": target_type,
+                          "advisory": str(vuln.get("PrimaryURL") or ""),
+                      }
+                      key = (item["id"], item["package"], item["installed"], item["fixed"], target)
+                      unique[key] = item
+              ordered = sorted(
+                  unique.values(),
+                  key=lambda x: (-severity_weight.get(x["severity"], 0), x["id"], x["package"]),
+              )
+              counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+              for finding in ordered:
+                  severity = finding["severity"]
+                  counts[severity] = counts.get(severity, 0) + 1
+              scan_metrics = {
+                  **counts,
+                  "total": len(ordered),
+                  "weighted_score": sum(severity_weight.get(k, 0) * v for k, v in counts.items()),
+              }
+              limit = 200
+              return {
+                  "total_unique": len(ordered),
+                  "truncated": len(ordered) > limit,
+                  "metrics": scan_metrics,
+                  "findings": ordered[:limit],
+              }
+
+          def metrics(compact: dict[str, Any]) -> dict[str, int]:
+              return dict(compact["metrics"])
+
+          def source_context() -> tuple[dict[str, str], set[str]]:
+              files: list[Path] = [DOCKERFILE]
+              files.extend(p for p in Path(".").glob("requirements*.txt") if p.is_file())
+              if Path("go.mod").is_file():
+                  files.append(Path("go.mod"))
+              context: dict[str, str] = {}
+              allowlist: set[str] = set()
+              remaining = 60_000
+              for path in files:
+                  normalized = path.as_posix()
+                  if path.is_symlink() or path.stat().st_size > 100_000:
+                      continue
+                  text = path.read_text(encoding="utf-8")
+                  excerpt = text[:remaining]
+                  context[normalized] = excerpt
+                  allowlist.add(normalized)
+                  remaining -= len(excerpt)
+                  if remaining <= 0:
+                      break
+              return context, allowlist
+
+          def prompt_for(compact: dict[str, Any], context: dict[str, str], attempted: list[dict[str, Any]]) -> str:
+              payload = {
+                  "trivy": compact,
+                  "root_artifact_source_files": context,
+                  "already_attempted": attempted,
+              }
+              return (
+                  "Act as a container security remediation researcher. Use Google Search to verify current, "
+                  "authoritative release or advisory information. Determine whether one explicit root artifact "
+                  "present in the supplied source files causes multiple or important Trivy findings. Root artifact "
+                  "means a base image, an existing Dockerfile ARG, an explicitly pinned top-level requirements.txt "
+                  "dependency, or a direct go.mod module. Never propose adding or directly upgrading a transitive OS "
+                  "package merely because Trivy names it. Never propose editing compiled binaries, lockfiles, generated "
+                  "files, or arbitrary Dockerfile commands. Select the smallest stable compatible version that fixes "
+                  "the findings and verify that the exact target exists. The current value must exactly match source. "
+                  "For base_image, current and target must be complete image references as they appear after FROM "
+                  "(excluding AS alias). For dockerfile_arg, name is the ARG variable and current/target are its values. "
+                  "For requirements, name is the exact distribution name and values exclude ==. For go_module, name is "
+                  "the exact module path. Return no_action if evidence is insufficient, confidence is below 0.90, only "
+                  "a transitive artifact could be changed, no stable fix exists, or the prior attempt should not be "
+                  "repeated. Evidence URLs must be pages actually consulted through Google Search.\n\nINPUT:\n"
+                  + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+              )
+
+          def call_gemini(prompt: str, round_number: int) -> dict[str, Any]:
+              if not os.environ.get("GEMINI_API_KEY"):
+                  raise RuntimeError("GEMINI_API_KEY is not configured")
+              client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+              last_error: Exception | None = None
+              for attempt in range(4):
+                  try:
+                      interaction = client.interactions.create(
+                          model=MODEL,
+                          input=prompt,
+                          tools=[{"type": "google_search"}],
+                          response_format={
+                              "type": "text",
+                              "mime_type": "application/json",
+                              "schema": schema,
+                          },
+                      )
+                      raw_path = ARTIFACT_DIR / f"gemini-interaction-round-{round_number}.json"
+                      try:
+                          raw_path.write_text(interaction.model_dump_json(indent=2), encoding="utf-8")
+                      except Exception:
+                          raw_path.write_text(str(interaction), encoding="utf-8")
+                      return json.loads(interaction.output_text)
+                  except Exception as exc:
+                      last_error = exc
+                      if attempt < 3:
+                          time.sleep(15 * (attempt + 1))
+              raise RuntimeError(f"Gemini failed after retries: {last_error}")
+
+          def safe_repo_file(value: str, allowlist: set[str]) -> Path:
+              path = Path(value)
+              normalized = path.as_posix()
+              if path.is_absolute() or ".." in path.parts or normalized not in allowlist:
+                  raise ValueError("candidate file is not an allowed source file")
+              if path.is_symlink():
+                  raise ValueError("candidate file is a symlink")
+              return path
+
+          def replace_once(text: str, pattern: str, replacement: str) -> str:
+              matches = list(re.finditer(pattern, text, flags=re.MULTILINE))
+              if len(matches) != 1:
+                  raise ValueError(f"expected exactly one source match; found {len(matches)}")
+              return re.sub(pattern, replacement, text, count=1, flags=re.MULTILINE)
+
+          def apply_candidate(plan: dict[str, Any], allowlist: set[str]) -> tuple[Path, str, str]:
+              artifact = plan["root_artifact"]
+              kind = artifact["type"]
+              path = safe_repo_file(str(artifact["file"]), allowlist)
+              old = str(artifact["current"])
+              new = str(artifact["target"])
+              name = str(artifact["name"])
+              if not old or not new or old == new or any(c in new for c in "\n\r"):
+                  raise ValueError("invalid or unchanged target version")
+              original = path.read_text(encoding="utf-8")
+
+              if kind == "base_image":
+                  if path != DOCKERFILE or any(c.isspace() for c in old + new):
+                      raise ValueError("invalid base-image candidate")
+                  pattern = rf"^(?P<prefix>\s*FROM(?:\s+--platform=\S+)?\s+){re.escape(old)}(?P<suffix>(?:\s+AS\s+\S+)?\s*)$"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "dockerfile_arg":
+                  if path != DOCKERFILE or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                      raise ValueError("invalid Dockerfile ARG candidate")
+                  pattern = rf"^(?P<prefix>\s*ARG\s+{re.escape(name)}\s*=\s*){re.escape(old)}(?P<suffix>\s*)$"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "requirements":
+                  if path.name not in allowed_manifest_names or path.suffix != ".txt":
+                      raise ValueError("requirements candidate is not allowlisted")
+                  pattern = rf"^(?P<prefix>\s*{re.escape(name)}\s*==\s*){re.escape(old)}(?P<suffix>\s*(?:#.*)?)$"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              elif kind == "go_module":
+                  if path.as_posix() != "go.mod":
+                      raise ValueError("go module candidate must target go.mod")
+                  pattern = rf"^(?P<prefix>\s*{re.escape(name)}\s+){re.escape(old)}(?P<suffix>\s*)$"
+                  updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+              else:
+                  raise ValueError("unsupported root artifact type")
+
+              if updated == original:
+                  raise ValueError("candidate produced no change")
+              path.write_text(updated, encoding="utf-8")
+              return path, original, hashlib.sha256(updated.encode()).hexdigest()
+
+          def scan_image(image: str, output: Path) -> None:
+              subprocess.run(
+                  [
+                      "trivy", "image", "--format", "json", "--output", str(output),
+                      "--severity", SEVERITIES, "--ignore-unfixed", "--exit-code", "0", image,
+                  ],
+                  check=True,
+              )
+
+          baseline_path = ARTIFACT_DIR / "trivy-round-0.json"
+          current_compact = compact_scan(load_scan(baseline_path))
+          write_json(ARTIFACT_DIR / "compact-round-0.json", current_compact)
+          current_metrics = metrics(current_compact)
+          current_image = BASELINE_IMAGE
+          attempted: list[dict[str, Any]] = []
+          accepted: list[dict[str, Any]] = []
+          stop_reason = "maximum_rounds_reached"
+
+          for round_number in range(1, MAX_ROUNDS + 1):
+              if current_metrics["total"] == 0:
+                  stop_reason = "no_findings"
+                  break
+
+              context, allowlist = source_context()
+              try:
+                  plan = call_gemini(prompt_for(current_compact, context, attempted), round_number)
+              except Exception as exc:
+                  stop_reason = "gemini_error"
+                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  break
+
+              write_json(ARTIFACT_DIR / f"plan-round-{round_number}.json", plan)
+              attempted.append(plan)
+              if plan.get("action") == "no_action":
+                  stop_reason = "no_action"
+                  break
+              if float(plan.get("confidence", 0)) < MIN_CONFIDENCE:
+                  stop_reason = "confidence_below_threshold"
+                  break
+              evidence = plan.get("evidence") or []
+              current_cves = {finding["id"] for finding in current_compact["findings"]}
+              affected_cves = set(plan.get("affected_cves") or [])
+              if (
+                  not evidence
+                  or not all(re.match(r"^https://", str(item.get("url", ""))) for item in evidence)
+                  or not (affected_cves & current_cves)
+              ):
+                  stop_reason = "insufficient_evidence"
+                  break
+
+              changed_path: Path | None = None
+              original_text = ""
+              try:
+                  changed_path, original_text, changed_hash = apply_candidate(plan, allowlist)
+              except ValueError as exc:
+                  stop_reason = "no_change_or_rejected_patch"
+                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  break
+
+              try:
+                  candidate_image = f"{os.environ['IMAGE_NAME']}:remediation-{os.environ['GITHUB_RUN_ID']}-{round_number}"
+                  subprocess.run(
+                      ["docker", "build", ".", "--file", str(DOCKERFILE), "--tag", candidate_image],
+                      check=True,
+                  )
+                  scan_path = ARTIFACT_DIR / f"trivy-round-{round_number}.json"
+                  scan_image(candidate_image, scan_path)
+              except Exception as exc:
+                  if changed_path is not None:
+                      changed_path.write_text(original_text, encoding="utf-8")
+                  stop_reason = "patch_build_or_scan_failed"
+                  write_json(ARTIFACT_DIR / f"error-round-{round_number}.json", {"error": str(exc)})
+                  break
+
+              candidate_compact = compact_scan(load_scan(scan_path))
+              write_json(ARTIFACT_DIR / f"compact-round-{round_number}.json", candidate_compact)
+              candidate_metrics = metrics(candidate_compact)
+              improvement = current_metrics["weighted_score"] - candidate_metrics["weighted_score"]
+              critical_regressed = candidate_metrics["CRITICAL"] > current_metrics["CRITICAL"]
+              meaningful = improvement >= 10 and not critical_regressed
+              comparison = {
+                  "before": current_metrics,
+                  "after": candidate_metrics,
+                  "weighted_improvement": improvement,
+                  "meaningful": meaningful,
+                  "changed_file": changed_path.as_posix(),
+                  "changed_sha256": changed_hash,
+              }
+              write_json(ARTIFACT_DIR / f"comparison-round-{round_number}.json", comparison)
+
+              if not meaningful:
+                  changed_path.write_text(original_text, encoding="utf-8")
+                  stop_reason = "no_meaningful_improvement"
+                  break
+
+              accepted.append({"round": round_number, "plan": plan, "comparison": comparison})
+              current_compact = candidate_compact
+              current_metrics = candidate_metrics
+              current_image = candidate_image
+              stop_reason = "accepted"
+
+          changed = bool(accepted)
+          summary = {
+              "changed": changed,
+              "accepted_rounds": accepted,
+              "stop_reason": stop_reason,
+              "final_image": current_image,
+              "final_metrics": current_metrics,
+          }
+          write_json(ARTIFACT_DIR / "remediation-summary.json", summary)
+          accepted_files = sorted({item["comparison"]["changed_file"] for item in accepted})
+          (ARTIFACT_DIR / "accepted-files.txt").write_text(
+              "".join(f"{path}\n" for path in accepted_files), encoding="utf-8"
+          )
+          (ARTIFACT_DIR / "accepted.diff").write_text(
+              subprocess.run(["git", "diff", "--"], check=False, capture_output=True, text=True).stdout,
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"changed={'true' if changed else 'false'}\n")
+              output.write(f"stop_reason={stop_reason}\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Rebuild final image with accepted source state
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build . \
+            --file "$DOCKERFILE_PATH" \
+            --tag "$IMAGE_NAME:$IMAGE_REF_TAG" \
+            --tag "$IMAGE_NAME:latest"
+
+      - name: Run final Trivy validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy image \
+            --format json \
+            --output remediation-artifacts/trivy-final.json \
+            --severity "$TRIVY_SEVERITIES" \
+            --ignore-unfixed \
+            --exit-code 0 \
+            "$IMAGE_NAME:$IMAGE_REF_TAG"
+          trivy image \
+            --format sarif \
+            --output trivy-results.sarif \
+            --severity "$TRIVY_SEVERITIES" \
+            --ignore-unfixed \
+            --exit-code 0 \
+            "$IMAGE_NAME:$IMAGE_REF_TAG"
+
+      - name: Upload final Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push final Docker image
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_NAME:$IMAGE_REF_TAG"
+          docker push "$IMAGE_NAME:latest"
+
+      - name: Commit and push validated remediation
+        if: ${{ !endsWith(github.ref_name, '_gemini_scan') && steps.remediate.outputs.changed == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Validated remediation diff ==="
+          git diff --check
+          git diff
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          new_ref="${GITHUB_REF_NAME}-${GITHUB_RUN_ID}_gemini_scan"
+          git switch -c "$new_ref"
+          while IFS= read -r changed_file; do
+            [[ -n "$changed_file" ]] && git add -- "$changed_file"
+          done < remediation-artifacts/accepted-files.txt
+
+          if git diff --cached --quiet; then
+            echo "No validated source changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: apply validated Gemini security remediation ($GITHUB_REF_NAME)"
+          git push origin "HEAD:refs/heads/$new_ref"
+
+      - name: Upload remediation audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remediation-audit-${{ github.run_id }}
+          path: |
+            remediation-artifacts/
+            trivy-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
