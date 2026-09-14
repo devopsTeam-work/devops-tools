@@ -57,15 +57,21 @@ ARG KUBECTL_VERSION=1.31.0
 ARG YQ_VERSION=4.53.4
 ARG RANCHER_VERSION=2.11.9
 
-# Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
 
 RUN mkdir -p /out/bin /out/jfr
 
-# rancher cli
-RUN curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" | tar -xz -C /tmp && \
-    mv /tmp/rancher-${RANCHER_VERSION}/rancher /out/bin/rancher_v${RANCHER_VERSION} && \
-    rm -rf /tmp/rancher-v${RANCHER_VERSION}; 
+# Rancher CLI
+RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
+    && curl ${CURL_OPTS} \
+        "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" \
+        -o /tmp/rancher-cli.tar.gz \
+    && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
+    && mv "/tmp/rancher-v${RANCHER_VERSION}/rancher" \
+          "/out/bin/rancher_${RANCHER_VERSION}" \
+    && chmod 0755 "/out/bin/rancher_${RANCHER_VERSION}" \
+    && rm -f /tmp/rancher-cli.tar.gz \
+    && rm -rf "/tmp/rancher-v${RANCHER_VERSION}"
 
 # 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
