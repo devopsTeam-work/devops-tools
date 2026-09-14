@@ -68,8 +68,8 @@ RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
         -o /tmp/rancher-cli.tar.gz \
     && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
     && mv "/tmp/rancher-v${RANCHER_VERSION}/rancher" \
-          "/out/bin/rancher_${RANCHER_VERSION}" \
-    && chmod 0755 "/out/bin/rancher_${RANCHER_VERSION}" \
+          "/out/bin/rancher" \
+    && chmod 0755 "/out/bin/rancher_" \
     && rm -f /tmp/rancher-cli.tar.gz \
     && rm -rf "/tmp/rancher-v${RANCHER_VERSION}"
 
@@ -145,7 +145,7 @@ COPY --from=uv /uv /bin/
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
 COPY --from=builder /out/jfr /opt/jfr
-COPY --from=builder /out/bin/rancher_${RANCHER_VERSION} /opt/rancher_${RANCHER_VERSION}
+COPY --from=builder /out/bin/rancher /opt/rancher
 ENV JAVA_HOME=/usr \
     JENKINS_HOME=/opt/jenkins \
     PATH="/opt/jfr/bin:${PATH}" \
