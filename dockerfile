@@ -63,9 +63,9 @@ ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-ti
 RUN mkdir -p /out/bin /out/jfr
 
 # rancher cli
-RUN curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RANCHER_VERSION}/rancher-linux-amd64-${RANCHER_VERSION}.tar.gz" | tar -xz -C /tmp && \
-    mv /tmp/rancher-${RANCHER_VERSION}/rancher /out/bin/rancher_${RANCHER_VERSION} && \
-    rm -rf /tmp/rancher-${RANCHER_VERSION}; \
+RUN curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" | tar -xz -C /tmp && \
+    mv /tmp/rancher-${RANCHER_VERSION}/rancher /out/bin/rancher_v${RANCHER_VERSION} && \
+    rm -rf /tmp/rancher-v${RANCHER_VERSION}; 
 
 # 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
