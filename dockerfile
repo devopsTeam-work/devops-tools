@@ -218,5 +218,4 @@ RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
 
 
-RUN rancher --version
 ENTRYPOINT ["jenkinsfile-runner", "-w", "/opt/jenkins", "-f", "/workspace/Jenkinsfile", "-p", "/opt/jenkins/plugins", "--workspace", "/workspace"]
