@@ -69,7 +69,7 @@ RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
     && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
     && mv "/tmp/rancher-v${RANCHER_VERSION}/rancher" \
           "/out/bin/rancher" \
-    && chmod 0755 "/out/bin/rancher_" \
+    && chmod 0755 "/out/bin/rancher" \
     && rm -f /tmp/rancher-cli.tar.gz \
     && rm -rf "/tmp/rancher-v${RANCHER_VERSION}"
 
