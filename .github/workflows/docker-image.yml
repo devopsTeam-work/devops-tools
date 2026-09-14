@@ -12,8 +12,9 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: devops-tools
-  # Free-tier inference without paid Google Search grounding.
-  GEMINI_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite
+  # Try the stronger decision model first. Quota/availability errors fall back
+  # immediately to the free-tier Lite models; Google Search remains disabled.
+  GEMINI_MODELS: gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite
   GEMINI_MAX_FINDING_GROUPS: "30"
   GEMINI_MAX_SOURCE_CHARS: "16000"
   MAX_GEMINI_ROUNDS: "2"
@@ -195,6 +196,20 @@ jobs:
                   "action": {"type": "string", "enum": ["upgrade", "no_action"]},
                   "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                   "summary": {"type": "string"},
+                  "selection_rationale": {"type": "string"},
+                  "alternatives_considered": {
+                      "type": "array",
+                      "maxItems": 5,
+                      "items": {
+                          "type": "object",
+                          "additionalProperties": False,
+                          "properties": {
+                              "target": {"type": "string"},
+                              "reason": {"type": "string"},
+                          },
+                          "required": ["target", "reason"],
+                      },
+                  },
                   "root_artifact": {
                       "type": "object",
                       "additionalProperties": False,
@@ -229,7 +244,10 @@ jobs:
                       },
                   },
               },
-              "required": ["action", "confidence", "summary", "root_artifact", "affected_cves", "evidence"],
+              "required": [
+                  "action", "confidence", "summary", "selection_rationale",
+                  "alternatives_considered", "root_artifact", "affected_cves", "evidence"
+              ],
           }
 
           def write_json(path: Path, value: Any) -> None:
@@ -352,6 +370,7 @@ jobs:
           github_release_cache: dict[str, list[str]] = {}
           npm_version_cache: dict[str, list[str]] = {}
           hashicorp_version_cache: dict[str, list[str]] = {}
+          directory_version_cache: dict[str, list[str]] = {}
           recognized_dynamic_sources: dict[str, str] = {}
           allowlist_discovery_errors: list[dict[str, str]] = []
 
@@ -380,6 +399,15 @@ jobs:
               except InvalidVersion:
                   return None
 
+          def bounded_version_values(values: list[tuple[Version, str]]) -> list[str]:
+              """Keep nearby and newest candidates instead of only arbitrary +1 releases."""
+              ordered = sorted(set(values), key=lambda item: (item[0], item[1]))
+              if len(ordered) <= MAX_TARGETS_PER_ARTIFACT:
+                  return [value for _, value in ordered]
+              nearby_count = MAX_TARGETS_PER_ARTIFACT // 2
+              selected = ordered[:nearby_count] + ordered[-(MAX_TARGETS_PER_ARTIFACT - nearby_count):]
+              return [value for _, value in selected]
+
           def stable_compatible_tags(current: str, tags: list[str]) -> list[str]:
               parsed_current = comparable_tag(current)
               if parsed_current is None:
@@ -393,11 +421,12 @@ jobs:
                   version, prefix, suffix = parsed
                   if prefix != current_prefix or suffix != current_suffix or version <= current_version:
                       continue
+                  if version.major != current_version.major:
+                      continue
                   if version.is_prerelease or version.is_devrelease:
                       continue
                   candidates.append((version, tag))
-              candidates.sort(key=lambda item: item[0])
-              return [tag for _, tag in candidates[:MAX_TARGETS_PER_ARTIFACT]]
+              return bounded_version_values(candidates)
 
           def normalized_image_repository(repository: str) -> str:
               parts = repository.split("/")
@@ -466,9 +495,14 @@ jobs:
                       version = Version(value)
                   except InvalidVersion:
                       continue
-                  if version > current_version and not version.is_prerelease and not version.is_devrelease:
+                  if (
+                      version > current_version
+                      and version.major == current_version.major
+                      and not version.is_prerelease
+                      and not version.is_devrelease
+                  ):
                       versions.append(version)
-              return [str(version) for version in sorted(set(versions))[:MAX_TARGETS_PER_ARTIFACT]]
+              return bounded_version_values([(version, str(version)) for version in versions])
 
           def semantic_upgrades(current: str, values: list[str]) -> list[str]:
               parsed_current = comparable_tag(current)
@@ -486,12 +520,16 @@ jobs:
                       version = Version(match.group(1))
                   except InvalidVersion:
                       continue
-                  if version > current_version and not version.is_prerelease:
+                  if (
+                      version > current_version
+                      and version.major == current_version.major
+                      and not version.is_prerelease
+                  ):
                       candidates.add(version)
-              return [
-                  f"{current_prefix}{version}{current_suffix}"
-                  for version in sorted(candidates)[:MAX_TARGETS_PER_ARTIFACT]
-              ]
+              return bounded_version_values([
+                  (version, f"{current_prefix}{version}{current_suffix}")
+                  for version in candidates
+              ])
 
           def github_release_versions(owner: str, repository: str, current: str) -> list[str]:
               key = f"{owner}/{repository}".lower()
@@ -541,6 +579,25 @@ jobs:
                   hashicorp_version_cache[product] = list((payload.get("versions") or {}).keys())
               return semantic_upgrades(current, hashicorp_version_cache[product])
 
+          def official_directory_versions(
+              index_url: str, entry_pattern: str, current: str
+          ) -> list[str]:
+              """Resolve versions from a bounded authoritative HTTPS directory index."""
+              cache_key = f"{index_url}|{entry_pattern}"
+              if cache_key not in directory_version_cache:
+                  request = urllib.request.Request(
+                      index_url,
+                      headers={"User-Agent": "trivy-gemini-remediation"},
+                  )
+                  with urllib.request.urlopen(
+                      request, timeout=NETWORK_TIMEOUT_SECONDS
+                  ) as response:
+                      html = response.read(2_000_000).decode("utf-8", errors="replace")
+                  directory_version_cache[cache_key] = re.findall(
+                      entry_pattern, html, flags=re.IGNORECASE
+                  )
+              return semantic_upgrades(current, directory_version_cache[cache_key])
+
           def go_versions(module: str, current: str) -> list[str]:
               if not shutil.which("go"):
                   raise RuntimeError("go is unavailable")
@@ -565,9 +622,15 @@ jobs:
                       version = Version(value.removeprefix("v"))
                   except InvalidVersion:
                       continue
-                  if version > current_version and not version.is_prerelease:
+                  if (
+                      version > current_version
+                      and version.major == current_version.major
+                      and not version.is_prerelease
+                  ):
                       candidates.append(version)
-              return [f"v{version}" for version in sorted(set(candidates))[:MAX_TARGETS_PER_ARTIFACT]]
+              return bounded_version_values([
+                  (version, f"v{version}") for version in candidates
+              ])
 
           def go_install_versions(package_path: str, current: str) -> list[str]:
               """Walk package parents until the authoritative Go module root is found."""
@@ -713,7 +776,8 @@ jobs:
                       if not variables:
                           continue
                       github_match = re.search(
-                          r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/releases/download/",
+                          r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/"
+                          r"(?:releases/download|archive/refs/tags)/",
                           url,
                           flags=re.IGNORECASE,
                       )
@@ -723,6 +787,7 @@ jobs:
                           flags=re.IGNORECASE,
                       )
                       known_github: tuple[str, str] | None = None
+                      known_directory: tuple[str, str, str] | None = None
                       if github_match:
                           known_github = (
                               github_match.group("owner"),
@@ -732,6 +797,24 @@ jobs:
                           known_github = ("helm", "helm")
                       elif re.search(r"dl\.k8s\.io/", url, flags=re.IGNORECASE):
                           known_github = ("kubernetes", "kubernetes")
+                      elif re.search(r"archives\.boost\.io/release/", url, flags=re.IGNORECASE):
+                          known_directory = (
+                              "boost-archives",
+                              "https://archives.boost.io/release/",
+                              r'href=["\'](\d+\.\d+\.\d+)/?["\']',
+                          )
+                      elif re.search(r"ftp\.gnu\.org/gnu/gcc/gcc-", url, flags=re.IGNORECASE):
+                          known_directory = (
+                              "gnu-gcc",
+                              "https://ftp.gnu.org/gnu/gcc/",
+                              r'href=["\']gcc-(\d+\.\d+\.\d+)/?["\']',
+                          )
+                      elif re.search(r"astron\.com/pub/tcsh/tcsh-", url, flags=re.IGNORECASE):
+                          known_directory = (
+                              "tcsh-archives",
+                              "https://astron.com/pub/tcsh/",
+                              r'href=["\'][^"\']*?tcsh-(\d+\.\d+\.\d+)(?:\.tar\.gz)?["\']',
+                          )
 
                       for variable in variables:
                           current = arg_defaults.get(variable, "")
@@ -769,6 +852,26 @@ jobs:
                                   )
                               except Exception as exc:
                                   record_discovery_error("hashicorp_releases", product, exc)
+                          elif known_directory:
+                              source_name, index_url, entry_pattern = known_directory
+                              try:
+                                  verified_source = f"official-index://{source_name}"
+                                  targets = official_directory_versions(
+                                      index_url, entry_pattern, current
+                                  )
+                                  recognized_dynamic_sources[variable] = verified_source
+                                  add(
+                                      "dockerfile_arg",
+                                      DOCKERFILE.as_posix(),
+                                      variable,
+                                      current,
+                                      targets,
+                                      verified_source,
+                                  )
+                              except Exception as exc:
+                                  record_discovery_error(
+                                      "official_directory", source_name, exc
+                                  )
 
               requirement_files = [p for p in Path(".").glob("requirements*.txt") if p.is_file()]
               for path in requirement_files:
@@ -1083,7 +1186,13 @@ jobs:
                   "files, or arbitrary Dockerfile commands. You may select only an artifact identity and exact target "
                   "listed in verified_upgrade_allowlist; those targets were obtained from authoritative registries. "
                   "Never construct, infer, reformat, or invent a target. Select the smallest compatible allowlisted "
-                  "version that addresses the evidence. related_trivy_findings are deterministic name/path ownership "
+                  "version that addresses the evidence. Never choose current+1 merely because it is adjacent. "
+                  "selection_rationale must explain the concrete supplied evidence and the selection rule. Compare "
+                  "the chosen target with up to four meaningful allowlisted alternatives in alternatives_considered; "
+                  "do not use remembered model knowledge as evidence and do not claim release-note facts absent from "
+                  "the input. When no target has stronger fix evidence, explicitly label the choice an empirical "
+                  "validation candidate and prefer the highest stable target within the current major, so the choice "
+                  "is deterministic rather than an arbitrary one-step bump. related_trivy_findings are deterministic name/path ownership "
                   "hints connecting an artifact to scanned binaries. When those hints show an exact binary ownership "
                   "match and a newer verified release exists, you may return upgrade as an empirical validation "
                   "candidate even when release notes do not prove the CVE fix; the mandatory rebuild and Trivy rescan "
@@ -1104,6 +1213,7 @@ jobs:
                   "allowlisted evidence-backed target or return no_action. Return no_action when the allowlist has no "
                   "appropriate target. For no_action, root_artifact.type must be none and file, name, current, and "
                   "target must all be empty strings. "
+                  "For no_action, selection_rationale must explain why and alternatives_considered may be empty. "
                   "Return the remediation decision using the configured JSON schema.\n\nINPUT:\n"
                   + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
               )
@@ -1257,6 +1367,23 @@ jobs:
                       raise ValueError("invalid Dockerfile ARG candidate")
                   pattern = rf"^(?P<prefix>\s*ARG\s+{re.escape(name)}\s*=\s*){re.escape(old)}(?P<suffix>\s*)$"
                   updated = replace_once(original, pattern, rf"\g<prefix>{new}\g<suffix>")
+                  # Boost commonly represents one release through synchronized
+                  # dotted and underscored ARGs. Treat them as one root artifact
+                  # and update the derived companion value atomically.
+                  if name.endswith("_DOT"):
+                      companion = name.removesuffix("_DOT") + "_UNDERSCORE"
+                      old_companion = old.replace(".", "_")
+                      new_companion = new.replace(".", "_")
+                      companion_pattern = (
+                          rf"^(?P<prefix>\s*ARG\s+{re.escape(companion)}\s*=\s*)"
+                          rf"{re.escape(old_companion)}(?P<suffix>\s*)$"
+                      )
+                      if re.search(companion_pattern, updated, flags=re.MULTILINE):
+                          updated = replace_once(
+                              updated,
+                              companion_pattern,
+                              rf"\g<prefix>{new_companion}\g<suffix>",
+                          )
               elif kind == "dockerfile_pip":
                   if path != DOCKERFILE or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
                       raise ValueError("invalid Dockerfile pip candidate")
@@ -1407,6 +1534,7 @@ jobs:
               write_json(
                   ARTIFACT_DIR / f"verified-allowlist-round-{round_number}.json",
                   {
+                      "all_discovered_artifacts": discovered_upgrades,
                       "artifacts": upgrade_allowlist,
                       "discovery_errors": allowlist_discovery_errors,
                       "unsupported_installers": installer_warnings,
@@ -1418,17 +1546,27 @@ jobs:
                   installer_warnings,
               )
               print(
-                  f"Verified upgrade allowlist: {len(upgrade_allowlist)} root artifacts, "
+                  f"Full verified upgrade allowlist: {len(discovered_upgrades)} root artifacts, "
+                  f"{sum(len(item['allowed_targets']) for item in discovered_upgrades)} exact targets",
+                  flush=True,
+              )
+              for item in discovered_upgrades:
+                  print(
+                      f"  - {item['type']} {item['file']}::{item['name']} "
+                      f"current={item['current']} source={item['verified_by']}",
+                      flush=True,
+                  )
+                  print(
+                      "      all_verified_targets="
+                      + json.dumps(item["allowed_targets"], ensure_ascii=False),
+                      flush=True,
+                  )
+              print(
+                  f"Eligible after previous-attempt filtering: {len(upgrade_allowlist)} "
+                  f"root artifacts, "
                   f"{sum(len(item['allowed_targets']) for item in upgrade_allowlist)} exact targets",
                   flush=True,
               )
-              for item in upgrade_allowlist:
-                  print(
-                      f"  - {item['type']} {item['file']}::{item['name']} "
-                      f"current={item['current']} targets={len(item['allowed_targets'])} "
-                      f"source={item['verified_by']}",
-                      flush=True,
-                  )
               if allowlist_discovery_errors:
                   print(
                       f"Allowlist discovery warnings: {len(allowlist_discovery_errors)} "
@@ -1487,6 +1625,8 @@ jobs:
                           "action": plan.get("action"),
                           "confidence": plan.get("confidence"),
                           "summary": plan.get("summary"),
+                          "selection_rationale": plan.get("selection_rationale"),
+                          "alternatives_considered": plan.get("alternatives_considered") or [],
                           "root_artifact": artifact_preview,
                           "affected_cves": plan.get("affected_cves") or [],
                           "evidence_count": len(plan.get("evidence") or []),
@@ -1520,6 +1660,31 @@ jobs:
                   )
                   if round_number < MAX_ROUNDS:
                       continue
+                  break
+              if not str(plan.get("selection_rationale", "")).strip():
+                  stop_reason = "missing_selection_rationale"
+                  break
+              selected_identity = (
+                  artifact_preview.get("type"), artifact_preview.get("file"),
+                  artifact_preview.get("name"), artifact_preview.get("current"),
+              )
+              selected_targets = next(
+                  set(item["allowed_targets"])
+                  for item in upgrade_allowlist
+                  if selected_identity
+                  == (item["type"], item["file"], item["name"], item["current"])
+              )
+              compared_targets = {
+                  str(item.get("target", ""))
+                  for item in (plan.get("alternatives_considered") or [])
+              }
+              if not compared_targets.issubset(selected_targets):
+                  stop_reason = "unverified_alternative_in_rationale"
+                  print(
+                      "Gemini rationale mentioned a target outside the artifact-specific "
+                      "verified allowlist; no source was changed.",
+                      flush=True,
+                  )
                   break
               evidence = plan.get("evidence") or []
               current_cves = {finding["id"] for finding in current_compact["findings"]}
