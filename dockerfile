@@ -117,7 +117,8 @@ RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 RUN /out/bin/jf --version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
     /out/bin/helm version --short >/dev/null && \
-    /out/bin/yq --version >/dev/null
+    /out/bin/yq --version >/dev/null && \
+    /out/bin/rancher-v${RANCHER_VERSION} --version >/dev/null
 
 # ==========================================================
 # Stage 2: Final Production Image (Ubuntu based for manylinux)
@@ -144,7 +145,7 @@ COPY --from=uv /uv /bin/
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
 COPY --from=builder /out/jfr /opt/jfr
-
+COPY --from=builder /out/bin/rancher_${RANCHER_VERSION} /opt/rancher_${RANCHER_VERSION}
 ENV JAVA_HOME=/usr \
     JENKINS_HOME=/opt/jenkins \
     PATH="/opt/jfr/bin:${PATH}" \
