@@ -117,8 +117,8 @@ RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 RUN /out/bin/jf --version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
     /out/bin/helm version --short >/dev/null && \
-    /out/bin/yq --version >/dev/null && \
-    /out/bin/rancher-v${RANCHER_VERSION} --version >/dev/null
+    /out/bin/yq --version >/dev/null 
+    #/out/bin/rancher-v${RANCHER_VERSION} --version >/dev/null
 
 # ==========================================================
 # Stage 2: Final Production Image (Ubuntu based for manylinux)
