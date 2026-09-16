@@ -160,7 +160,7 @@ RUN apt-get update && \
     wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
     unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server \
     iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates && \
-    apt-get clean && \
+    apt-get docker-buildx-plugin clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python and NPM packages
