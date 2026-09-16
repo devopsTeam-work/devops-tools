@@ -21,6 +21,7 @@ ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.10
 FROM ${CT_IMAGE} AS ct
 FROM ${UV_IMAGE} AS uv
 
+
 # ==========================================================
 # Stage 1: Binaries Downloader & Builder
 # ==========================================================
@@ -46,18 +47,26 @@ ARG KUSTOMIZE_VERSION=5.8.1
 ARG JCLI_VERSION=0.0.47
 ARG HELMIFY_VERSION=0.4.20
 ARG JFROG_CLI_VERSION=2.123.0
-ARG RANCHER_VERSIONS="v2.15.1 v2.10.1 v2.13.1"
-ARG RANCHER_DEFAULT=v2.13.1
 ARG HELM_VERSION=3.21.4
-ARG KUBECTL_VERSION=1.31.0
+ARG KUBECTL_VERSION=1.37.0
 ARG YQ_VERSION=4.53.4
+ARG RANCHER_VERSION=2.15.1
 
-# Hardened curl defaults: HTTPS only, modern TLS, retry, fail on HTTP error
 ENV CURL_OPTS="--proto =https --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --max-time 600"
 
 RUN mkdir -p /out/bin /out/jfr
 
-
+# Rancher CLI
+RUN : "${RANCHER_VERSION:?RANCHER_VERSION is not defined}" \
+    && curl ${CURL_OPTS} \
+        "https://github.com/rancher/cli/releases/download/v${RANCHER_VERSION}/rancher-linux-amd64-v${RANCHER_VERSION}.tar.gz" \
+        -o /tmp/rancher-cli.tar.gz \
+    && tar -xzf /tmp/rancher-cli.tar.gz -C /tmp \
+    && mv "/tmp/rancher-v${RANCHER_VERSION}/rancher" \
+          "/out/bin/rancher" \
+    && chmod 0755 "/out/bin/rancher" \
+    && rm -f /tmp/rancher-cli.tar.gz \
+    && rm -rf "/tmp/rancher-v${RANCHER_VERSION}"
 
 # 2. Jenkins CLI (jcli)
 RUN curl ${CURL_OPTS} "https://github.com/jenkins-zh/jenkins-cli/releases/download/v${JCLI_VERSION}/jcli-linux-amd64.tar.gz" \
@@ -71,15 +80,6 @@ RUN curl ${CURL_OPTS} -o /tmp/jfr.zip "https://github.com/jenkinsci/jenkinsfile-
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
     curl ${CURL_OPTS} -o /out/bin/jf \
       "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/${JFROG_CLI_VERSION}/jfrog-cli-linux-${ARCH}/jf"
-
-# 5. Rancher CLIs
-#RUN for RV in ${RANCHER_VERSIONS}; do \
-#        curl ${CURL_OPTS} "https://github.com/rancher/cli/releases/download/${RV}/rancher-linux-amd64-${RV}.tar.gz" | tar -xz -C /tmp && \
-#        mv /tmp/rancher-${RV}/rancher /out/bin/rancher_${RV} && \
-#        rm -rf /tmp/rancher-${RV}; \
-#    done && \
-#    cd /out/bin && ln -sf "rancher_${RANCHER_DEFAULT}" rancher
-
 
 
 # 8. Kubernetes tooling
@@ -112,7 +112,8 @@ RUN chmod 0755 /out/bin/* /out/jfr/bin/jenkinsfile-runner
 RUN /out/bin/jf --version >/dev/null && \
     /out/bin/kubectl version --client >/dev/null && \
     /out/bin/helm version --short >/dev/null && \
-    /out/bin/yq --version >/dev/null
+    /out/bin/yq --version >/dev/null 
+    #/out/bin/rancher-v${RANCHER_VERSION} --version >/dev/null
 
 # ==========================================================
 # Stage 2: Final Production Image (Ubuntu based for manylinux)
@@ -125,6 +126,7 @@ LABEL org.opencontainers.image.title="devops-jenkinsfile-runner" \
 
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
+# ----------------------------------------------------------
 
 # Copy external binary tools (from the ARG-driven stages -- the hardcoded
 # quay.io/ghcr.io refs ignored ${CT_IMAGE}/${UV_IMAGE} and broke the air-gapped build)
@@ -134,7 +136,7 @@ COPY --from=uv /uv /bin/
 # Copy all pre-downloaded binaries from builder stage
 COPY --from=builder /out/bin/ /usr/local/bin/
 COPY --from=builder /out/jfr /opt/jfr
-
+COPY --from=builder /out/bin/rancher /opt/rancher
 ENV JAVA_HOME=/usr \
     JENKINS_HOME=/opt/jenkins \
     PATH="/opt/jfr/bin:${PATH}" \
@@ -142,15 +144,15 @@ ENV JAVA_HOME=/usr \
     DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
-# Install base OS packages via apt (Ubuntu)
+# Install base OS packages via apt (Ubuntu).
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     git git-lfs bash tcsh curl sudo python3 python3-pip python3-venv iputils-ping tcpdump \
     wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
-    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server  \
+    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server \
     iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates docker.io docker-buildx && \
-    apt-get  clean && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python and NPM packages
@@ -205,6 +207,6 @@ RUN mkdir -p ${JENKINS_HOME}/plugins && \
 # Final cleanup: no build caches, no leftover archives in the image
 RUN rm -rf /root/.cache /root/.npm /tmp/* /var/tmp/*
 
-WORKDIR /workspace
+
 
 ENTRYPOINT ["jenkinsfile-runner", "-w", "/opt/jenkins", "-f", "/workspace/Jenkinsfile", "-p", "/opt/jenkins/plugins", "--workspace", "/workspace"]
