@@ -149,8 +149,7 @@ RUN apt-get update && \
     git git-lfs bash tcsh curl sudo python3 python3-pip python3-venv iputils-ping tcpdump \
     wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
     unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server  \
-    iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates docker-ce \
-    docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
+    iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates docker.io docker-buildx && \
     apt-get  clean && \
     rm -rf /var/lib/apt/lists/*
 
