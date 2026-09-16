@@ -9,10 +9,7 @@
 ARG REGISTRY=docker.io
 ARG ALPINE_TAG=3.22
 # 28.0.1 shipped dockerd/runc built with Go 1.23.6 -> 15 open stdlib CVEs in Trivy.
-# Needs a dind built with Go >= 1.24.9 (CVE-2025-58187 is the highest bar).
 # Avoid 29.7.0 (known archive-extraction regression). Verify the tag exists in
-# Artifactory and re-scan before locking. Conservative alt: ARG DIND_TAG=28.5.2-dind
-ARG DIND_TAG=29.8.0-dind
 ARG CT_IMAGE=quay.io/helmpack/chart-testing:v3.14.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.10
 
@@ -21,8 +18,6 @@ ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.10
 #   --build-arg REGISTRY=artifactory.corp/docker-remote \
 #   --build-arg CT_IMAGE=artifactory.corp/quay-remote/helmpack/chart-testing:v3.14.0 \
 #   --build-arg UV_IMAGE=artifactory.corp/ghcr-remote/astral-sh/uv:0.12.10
-# For full reproducibility pin by digest instead of tag: docker:29.8.0-dind@sha256:...
-FROM ${REGISTRY}/library/docker:${DIND_TAG} AS dind
 FROM ${CT_IMAGE} AS ct
 FROM ${UV_IMAGE} AS uv
 
@@ -130,11 +125,6 @@ LABEL org.opencontainers.image.title="devops-jenkinsfile-runner" \
 
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
-# ----------------------------------------------------------
-# PRESERVE DIND CAPABILITIES:
-# Copy statically compiled Docker daemon, cli and scripts directly from official dind.
-# ----------------------------------------------------------
-COPY --from=dind /usr/local/bin/ /usr/local/bin/
 
 # Copy external binary tools (from the ARG-driven stages -- the hardcoded
 # quay.io/ghcr.io refs ignored ${CT_IMAGE}/${UV_IMAGE} and broke the air-gapped build)
@@ -152,14 +142,15 @@ ENV JAVA_HOME=/usr \
     DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
-# Install base OS packages via apt (Ubuntu). Includes DinD prerequisites.
+# Install base OS packages via apt (Ubuntu)
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     git git-lfs bash tcsh curl sudo python3 python3-pip python3-venv iputils-ping tcpdump \
     wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
-    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server docker-buildx-plugin \
-    iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates && \
+    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server  \
+    iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates docker-ce \
+    docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
     apt-get  clean && \
     rm -rf /var/lib/apt/lists/*
 
