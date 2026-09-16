@@ -158,9 +158,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git git-lfs bash tcsh curl sudo python3 python3-pip python3-venv iputils-ping tcpdump \
     wget skopeo zip util-linux jq vim nano podman podman-compose fuse-overlayfs openjdk-21-jre-headless \
-    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server \
+    unzip tar fonts-dejavu-core npm sshpass openssh-client openssh-server docker-buildx-plugin \
     iptables openssl uidmap xfsprogs xz-utils pigz btrfs-progs e2fsprogs kmod ca-certificates && \
-    apt-get docker-buildx-plugin clean && \
+    apt-get  clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python and NPM packages
